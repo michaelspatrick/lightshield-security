@@ -3,7 +3,7 @@
 Plugin Name: LightShield Security
 Description: Lightweight protection against brute force login attempts, bad bots, xmlrpc access, and simple request spikes. Includes IP whitelist/blocklist with a clean admin UI. Optional Cloudflare IP blocking at the edge.
 Version: 1.1.4
-Author: Michael Patrick
+Author: Dragon Society International
 License: GPLv2 or later
 */
 
@@ -400,8 +400,8 @@ function ls_render_admin_page() {
                 <tr>
                     <td><?php echo esc_html($ip); ?></td>
                     <td><?php echo esc_html($entry['reason'] ?? ''); ?></td>
-                    <td><?php echo !empty($entry['blocked_at']) ? esc_html(date_i18n(get_option('date_format').' '.get_option('time_format'), intval($entry['blocked_at']))) : ''; ?></td>
-                    <td><?php echo !empty($entry['until']) ? esc_html(date_i18n(get_option('date_format').' '.get_option('time_format'), intval($entry['until']))) : ''; ?></td>
+                    <td><?php echo !empty($entry['blocked_at']) ? esc_html(wp_date(get_option('date_format').' '.get_option('time_format'), intval($entry['blocked_at']))) : ''; ?></td>
+                    <td><?php echo !empty($entry['until']) ? esc_html(wp_date(get_option('date_format').' '.get_option('time_format'), intval($entry['until']))) : ''; ?></td>
                     <td><?php echo !empty($cf_map[$ip]) ? '<span class="dashicons dashicons-cloud"></span>' : '&mdash;'; ?></td>
                     <td>
                         <form method="post" style="display:inline;">
