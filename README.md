@@ -1,6 +1,6 @@
 # LightShield Security (WordPress)
 
-**Version:** 1.1.4
+**Version:** 1.2.1
 **Author:** Michael Patrick
 **License:** GPLv2 or later
 
@@ -23,6 +23,12 @@ When enabled, every IP that LightShield blocks is also pushed to **Cloudflare IP
 - Create: `POST /client/v4/zones/{zone_id}/firewall/access_rules/rules` with `{"mode":"block","configuration":{"target":"ip","value":"<IP>"}}`
 - Delete: `DELETE /client/v4/zones/{zone_id}/firewall/access_rules/rules/{rule_id}`
 - The plugin stores the returned `rule_id` mapped to the IP and removes it on unblock.
+
+**New in 1.2.0**
+- **404 / Probe blocker:** Blocks IPs that trigger many 404s in a short window (thresholds configurable).
+- **Malicious pattern filter:** Instant block on obvious exploit strings in URL/query. Add your own patterns.
+- **REST API lock:** Optional switch to require authentication for REST (with allowlist).
+- **Headers & cookies:** X-Frame-Options, X-Content-Type-Options, Referrer-Policy, optional CSP (Report-Only), and cookie hardening.
 
 ---
 

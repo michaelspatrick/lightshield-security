@@ -2,14 +2,14 @@
 /*
 Plugin Name: LightShield Security
 Description: Lightweight protection against brute force login attempts, bad bots, xmlrpc access, and simple request spikes. Includes IP whitelist/blocklist with a clean admin UI. Optional Cloudflare IP blocking at the edge.
-Version: 1.1.4
+Version: 1.2.1
 Author: Michael Patrick
 License: GPLv2 or later
 */
 
 if (!defined('ABSPATH')) { exit; }
 
-define('LS_VERSION', '1.1.4');
+define('LS_VERSION', '1.2.1');
 define('LS_OPTION_SETTINGS', 'ls_settings');
 define('LS_OPTION_BLOCKLIST', 'ls_blocklist');
 define('LS_OPTION_WHITELIST', 'ls_whitelist');
@@ -22,6 +22,7 @@ define('LS_OPTION_CF_MAP', 'ls_cf_map'); // ip => rule_id
 register_activation_hook(__FILE__, function () {
     if (!get_option(LS_OPTION_SETTINGS)) {
         add_option(LS_OPTION_SETTINGS, array(
+            // Core
             'trust_cloudflare'       => 1,
             'disable_xmlrpc'         => 1,
             'block_bad_ua'           => 1,
@@ -29,6 +30,26 @@ register_activation_hook(__FILE__, function () {
             'login_block_minutes'    => 15,
             'throttle_all'           => 0,
             'throttle_per_minute'    => 120,
+            // 404/probe blocker
+            'probe_enabled'          => 1,
+            'probe_threshold'        => 12,
+            'probe_window'           => 5,
+            'probe_block_minutes'    => 30,
+            // malicious pattern filter
+            'pattern_enabled'        => 1,
+            'pattern_block_minutes'  => 60,
+            // REST lock
+            'lock_rest'              => 0,
+            'rest_allowlist'         => "^/oembed/1\.0\n^/wp-site-health\n^/wp/v2/types\n^/wp/v2/taxonomies",
+            // headers/cookies
+            'headers_enabled'        => 1,
+            'header_xfo'             => 1,
+            'header_xcto'            => 1,
+            'header_refpol'          => 'strict-origin-when-cross-origin',
+            'csp_report_only'        => 0,
+            'csp_value'              => "default-src 'self' data: blob:; frame-ancestors 'self';",
+            'cookie_hardening'       => 1,
+            'disable_file_editor'    => 1,
         ));
     }
     if (!get_option(LS_OPTION_BLOCKLIST)) { add_option(LS_OPTION_BLOCKLIST, array()); }
@@ -117,7 +138,6 @@ function ls_cf_sync_cleanup() {
     $cf = get_option(LS_OPTION_CF, array());
     $keep_ips = array_keys(get_option(LS_OPTION_BLOCKLIST, array()));
     $deleted = 0;
-    // Pull first 200 rules and delete those with "LightShield" note not in keep list
     $data = ls_cf_http('GET', '/zones/' . rawurlencode($cf['zone_id']) . '/firewall/access_rules/rules?per_page=200');
     if ($data && !empty($data['result'])) {
         foreach ($data['result'] as $r) {
@@ -140,7 +160,6 @@ function ls_prune_blocklist() {
     $now = time();
     foreach ($blocklist as $ip => $entry) {
         if (empty($entry['until']) || $now >= intval($entry['until'])) {
-            // remove at Cloudflare too
             if (ls_cf_enabled()) { ls_cf_unblock_ip($ip); }
             unset($blocklist[$ip]);
             $changed = true;
@@ -204,25 +223,21 @@ function ls_block_ip($ip, $minutes, $reason) {
     do_action('lightshield_ip_blocked', $ip, $reason, $until);
 }
 
-/** Deny helper */
-function ls_forbid_now($message = '') {
-    status_header(403); nocache_headers(); header('Content-Type: text/plain; charset=utf-8');
-    echo ($message ?: 'Access denied by LightShield Security.'); exit;
-}
-
-/** Occasional prune on load (cheap) */
+/** Early request guard + protections */
 add_action('plugins_loaded', function () {
+    $settings = get_option(LS_OPTION_SETTINGS, array());
+    $ip = ls_get_client_ip();
+
+    // Quick prune tick
     $k = 'ls_prune_tick';
     if (!get_transient($k)) { ls_prune_blocklist(); set_transient($k, 1, 300); }
-    $ip = ls_get_client_ip();
+
     if (ls_is_whitelisted($ip)) { return; }
 
     if ($entry = ls_is_blocked($ip)) {
         $mins_left = max(1, floor(($entry['until'] - time())/60));
         ls_forbid_now('Access denied (' . $entry['reason'] . '). Try again in ~' . $mins_left . ' minute(s).');
     }
-
-    $settings = get_option(LS_OPTION_SETTINGS, array());
 
     if (!empty($settings['disable_xmlrpc'])) {
         $is_xmlrpc = false;
@@ -243,6 +258,34 @@ add_action('plugins_loaded', function () {
         if ($bad) { ls_block_ip($ip, 60, 'Bad user-agent'); ls_forbid_now('Bad user-agent.'); }
     }
 
+    // Malicious pattern filter (URI & query)
+    if (!empty($settings['pattern_enabled'])) {
+        $uri = isset($_SERVER['REQUEST_URI']) ? strtolower($_SERVER['REQUEST_URI']) : '';
+        $qs  = isset($_SERVER['QUERY_STRING']) ? strtolower($_SERVER['QUERY_STRING']) : '';
+        $hay = $uri . ' ' . $qs;
+        $list = get_option('ls_pattern_list_default');
+        if ($list === false) {
+            $list = array('../','.env','wp-config','/.git','id_rsa','php://','expect://','base64_decode','union select','information_schema','/etc/passwd','/composer.lock','/.hg/','/.svn/','/.DS_Store');
+            add_option('ls_pattern_list_default', $list);
+        }
+        $user_list_raw = trim($settings['pattern_list'] ?? '');
+        $user_list = array();
+        if ($user_list_raw !== '') {
+            foreach (preg_split('/\r\n|\r|\n/', $user_list_raw) as $line) {
+                $line = trim($line);
+                if ($line !== '' && $line[0] !== '#') { $user_list[] = strtolower($line); }
+            }
+        }
+        $check = array_unique(array_merge($list, $user_list));
+        foreach ($check as $needle) {
+            if ($needle && stripos($hay, $needle) !== false) {
+                ls_block_ip($ip, max(1, intval($settings['pattern_block_minutes'] ?? 60)), 'Malicious pattern');
+                ls_forbid_now('Access denied.');
+            }
+        }
+    }
+
+    // Global throttle (optional)
     if (!empty($settings['throttle_all'])) {
         if (!is_user_logged_in() || !current_user_can('manage_options')) {
             $limit = intval($settings['throttle_per_minute']);
@@ -261,13 +304,52 @@ add_action('plugins_loaded', function () {
         }
     }
 
-    add_action('template_redirect', function () { if (is_author()) { wp_redirect(home_url('/'), 301); exit; } });
-    add_filter('rest_endpoints', function ($endpoints) {
-        if (isset($endpoints['/wp/v2/users'])) { $endpoints['/wp/v2/users'] = array(); }
-        if (isset($endpoints['/wp/v2/users/(?P<id>[\d]+)'])) { $endpoints['/wp/v2/users/(?P<id>[\d]+)'] = array(); }
-        return $endpoints;
-    });
+    // Harden headers & cookies
+    if (!empty($settings['headers_enabled'])) {
+        add_action('send_headers', function () use ($settings) {
+            if (!headers_sent()) {
+                if (!empty($settings['header_xfo'])) { header('X-Frame-Options: SAMEORIGIN'); }
+                if (!empty($settings['header_xcto'])) { header('X-Content-Type-Options: nosniff'); }
+                if (!empty($settings['header_refpol'])) { header('Referrer-Policy: ' . $settings['header_refpol']); }
+                if (!empty($settings['csp_report_only']) && !empty($settings['csp_value'])) {
+                    header('Content-Security-Policy-Report-Only: ' . $settings['csp_value']);
+                }
+            }
+        }, 2);
+        if (!empty($settings['cookie_hardening'])) {
+            if (function_exists('is_ssl') && is_ssl()) {
+                add_filter('secure_auth_cookie', '__return_true', 999);
+                add_filter('secure_logged_in_cookie', '__return_true', 999);
+            }
+            @ini_set('session.cookie_httponly', '1');
+            @ini_set('session.cookie_secure', is_ssl() ? '1' : '0');
+            if (PHP_VERSION_ID >= 70300) { @ini_set('session.cookie_samesite', 'Lax'); }
+        }
+        if (!empty($settings['disable_file_editor'])) {
+            if (!defined('DISALLOW_FILE_EDIT')) { define('DISALLOW_FILE_EDIT', true); }
+        }
+    }
 });
+
+/** REST API lock: require auth except allowlist */
+add_filter('rest_authentication_errors', function ($result) {
+    $settings = get_option(LS_OPTION_SETTINGS, array());
+    if (empty($settings['lock_rest'])) { return $result; }
+    if (is_user_logged_in()) { return $result; }
+    $route = isset($_SERVER['REQUEST_URI']) ? parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH) : '';
+    $allow = array();
+    $raw = trim($settings['rest_allowlist'] ?? '');
+    if ($raw !== '') {
+        foreach (preg_split('/\r\n|\r|\n/', $raw) as $line) {
+            $line = trim($line);
+            if ($line !== '' && $line[0] !== '#') { $allow[] = $line; }
+        }
+    }
+    foreach ($allow as $pattern) {
+        if (@preg_match('~' . $pattern . '~', $route)) { return $result; }
+    }
+    return new WP_Error('ls_rest_locked', 'REST API requires authentication.', array('status' => 401));
+}, 10);
 
 /** Brute-force protection */
 add_action('wp_login_failed', function ($username) {
@@ -283,6 +365,32 @@ add_action('wp_login_failed', function ($username) {
     if ($fails >= $limit) { ls_block_ip($ip, $block_minutes, 'Too many failed logins'); ls_forbid_now('Too many failed logins.'); }
 });
 
+/** 404/probe blocker */
+add_action('template_redirect', function () {
+    $settings = get_option(LS_OPTION_SETTINGS, array());
+    if (empty($settings['probe_enabled']) || !is_404()) { return; }
+    $ip = ls_get_client_ip();
+    if (ls_is_whitelisted($ip)) { return; }
+    $win = max(1, intval($settings['probe_window'] ?? 5));
+    $th  = max(1, intval($settings['probe_threshold'] ?? 12));
+    $key = 'ls_p404_' . md5($ip);
+    $data = get_transient($key);
+    if ($data === false) { $data = 0; }
+    $data++;
+    set_transient($key, $data, $win * 60);
+    if ($data >= $th) {
+        $mins = max(1, intval($settings['probe_block_minutes'] ?? 30));
+        ls_block_ip($ip, $mins, 'Too many 404s/probes');
+        ls_forbid_now('Access denied.');
+    }
+}, 0);
+
+/** Deny helper */
+function ls_forbid_now($message = '') {
+    status_header(403); nocache_headers(); header('Content-Type: text/plain; charset=utf-8');
+    echo ($message ?: 'Access denied by LightShield Security.'); exit;
+}
+
 /** Admin UI */
 add_action('admin_menu', function () { add_menu_page('LightShield Security','LightShield','manage_options','lightshield-security','ls_render_admin_page','dashicons-shield-alt',59); });
 
@@ -293,6 +401,8 @@ function ls_admin_post_actions() {
 
     if ($action === 'save_settings') {
         $settings = get_option(LS_OPTION_SETTINGS, array());
+
+        // Core
         $settings['trust_cloudflare']    = !empty($_POST['trust_cloudflare']) ? 1 : 0;
         $settings['disable_xmlrpc']      = !empty($_POST['disable_xmlrpc']) ? 1 : 0;
         $settings['block_bad_ua']        = !empty($_POST['block_bad_ua']) ? 1 : 0;
@@ -300,19 +410,48 @@ function ls_admin_post_actions() {
         $settings['login_fail_limit']    = max(1, intval($_POST['login_fail_limit'] ?? 5));
         $settings['login_block_minutes'] = max(1, intval($_POST['login_block_minutes'] ?? 15));
         $settings['throttle_per_minute'] = max(1, intval($_POST['throttle_per_minute'] ?? 120));
+
+        // Probe
+        $settings['probe_enabled']       = !empty($_POST['probe_enabled']) ? 1 : 0;
+        $settings['probe_threshold']     = max(1, intval($_POST['probe_threshold'] ?? 12));
+        $settings['probe_window']        = max(1, intval($_POST['probe_window'] ?? 5));
+        $settings['probe_block_minutes'] = max(1, intval($_POST['probe_block_minutes'] ?? 30));
+
+        // Patterns
+        $settings['pattern_enabled']     = !empty($_POST['pattern_enabled']) ? 1 : 0;
+        $settings['pattern_block_minutes'] = max(1, intval($_POST['pattern_block_minutes'] ?? 60));
+        $settings['pattern_list']        = trim( wp_unslash( $_POST['pattern_list'] ?? '' ) );
+
+        // REST lock
+        $settings['lock_rest']           = !empty($_POST['lock_rest']) ? 1 : 0;
+        $settings['rest_allowlist']      = trim( wp_unslash( $_POST['rest_allowlist'] ?? '' ) );
+
+        // Headers/cookies
+        $settings['headers_enabled']     = !empty($_POST['headers_enabled']) ? 1 : 0;
+        $settings['header_xfo']          = !empty($_POST['header_xfo']) ? 1 : 0;
+        $settings['header_xcto']         = !empty($_POST['header_xcto']) ? 1 : 0;
+        $settings['header_refpol']       = sanitize_text_field( wp_unslash( $_POST['header_refpol'] ?? 'strict-origin-when-cross-origin' ) );
+        $settings['csp_report_only']     = !empty($_POST['csp_report_only']) ? 1 : 0;
+        $settings['csp_value']           = trim( wp_unslash( $_POST['csp_value'] ?? "default-src 'self' data: blob:; frame-ancestors 'self';" ) );
+        $settings['cookie_hardening']    = !empty($_POST['cookie_hardening']) ? 1 : 0;
+        $settings['disable_file_editor'] = !empty($_POST['disable_file_editor']) ? 1 : 0;
+
         update_option(LS_OPTION_SETTINGS, $settings, false);
 
         // Whitelist
-        $raw = trim($_POST['whitelist'] ?? '');
+        $raw = trim( wp_unslash( $_POST['whitelist'] ?? '' ) );
         $wl = array();
-        foreach (preg_split('/\r\n|\r|\n/', $raw) as $line) { $ip = trim($line); if ($ip !== '' && filter_var($ip, FILTER_VALIDATE_IP)) { $wl[] = $ip; } }
+        foreach (preg_split('/\r\n|\r|\n/', $raw) as $line) {
+            $ip = trim($line);
+            if ($ip !== '' && filter_var($ip, FILTER_VALIDATE_IP)) { $wl[] = $ip; }
+        }
         update_option(LS_OPTION_WHITELIST, array_values(array_unique($wl)), false);
 
         // Cloudflare settings
         $cf = get_option(LS_OPTION_CF, array());
         $cf['enabled'] = !empty($_POST['cf_enabled']) ? 1 : 0;
-        $cf['zone_id'] = sanitize_text_field($_POST['cf_zone_id'] ?? '');
-        $token = trim($_POST['cf_token'] ?? '');
+        $cf['zone_id'] = sanitize_text_field( wp_unslash( $_POST['cf_zone_id'] ?? '' ) );
+        $token = trim( wp_unslash( $_POST['cf_token'] ?? '' ) );
         $clear = !empty($_POST['cf_clear_token']);
         if ($clear) { $cf['token'] = ''; }
         elseif ($token !== '') { $cf['token'] = $token; }
@@ -385,6 +524,9 @@ function ls_render_admin_page() {
     $cf = get_option(LS_OPTION_CF, array());
     $cf_map = get_option(LS_OPTION_CF_MAP, array());
 
+    $fmt = get_option('date_format') . ' ' . get_option('time_format');
+    $tz  = function_exists('wp_timezone') ? wp_timezone() : null;
+
     settings_errors('ls_messages'); ?>
     <div class="wrap">
         <h1>LightShield Security</h1>
@@ -400,8 +542,12 @@ function ls_render_admin_page() {
                 <tr>
                     <td><?php echo esc_html($ip); ?></td>
                     <td><?php echo esc_html($entry['reason'] ?? ''); ?></td>
-                    <td><?php echo !empty($entry['blocked_at']) ? esc_html(wp_date(get_option('date_format').' '.get_option('time_format'), intval($entry['blocked_at']))) : ''; ?></td>
-                    <td><?php echo !empty($entry['until']) ? esc_html(wp_date(get_option('date_format').' '.get_option('time_format'), intval($entry['until']))) : ''; ?></td>
+                    <td>
+                        <?php if (!empty($entry['blocked_at'])) { $t=intval($entry['blocked_at']); echo esc_html(function_exists('wp_date')?wp_date($fmt,$t,$tz):date_i18n($fmt,$t)); } ?>
+                    </td>
+                    <td>
+                        <?php if (!empty($entry['until'])) { $t=intval($entry['until']); echo esc_html(function_exists('wp_date')?wp_date($fmt,$t,$tz):date_i18n($fmt,$t)); } ?>
+                    </td>
                     <td><?php echo !empty($cf_map[$ip]) ? '<span class="dashicons dashicons-cloud"></span>' : '&mdash;'; ?></td>
                     <td>
                         <form method="post" style="display:inline;">
@@ -434,64 +580,64 @@ function ls_render_admin_page() {
             <?php wp_nonce_field('ls_save', 'ls_nonce'); ?>
             <input type="hidden" name="ls_action" value="save_settings">
 
+            <h3>Core</h3>
+            <table class="form-table" role="presentation">
+                <tr><th scope="row">Trust Cloudflare Headers</th><td><label><input type="checkbox" name="trust_cloudflare" value="1" <?php checked(1, intval($settings['trust_cloudflare'] ?? 0)); ?>> Use <code>CF-Connecting-IP</code> / <code>X-Forwarded-For</code> for client IP</label></td></tr>
+                <tr><th scope="row">Disable XML-RPC</th><td><label><input type="checkbox" name="disable_xmlrpc" value="1" <?php checked(1, intval($settings['disable_xmlrpc'] ?? 0)); ?>> Block all <code>xmlrpc.php</code> requests (except whitelisted IPs)</label></td></tr>
+                <tr><th scope="row">Block Bad/Empty User-Agents</th><td><label><input type="checkbox" name="block_bad_ua" value="1" <?php checked(1, intval($settings['block_bad_ua'] ?? 0)); ?>> Immediately block known bad or empty user-agents</label></td></tr>
+                <tr><th scope="row">Global Throttle (optional)</th><td><label><input type="checkbox" name="throttle_all" value="1" <?php checked(1, intval($settings['throttle_all'] ?? 0)); ?>> Throttle all requests per IP (unauthenticated)</label><br><label>Requests per minute: <input type="number" name="throttle_per_minute" min="10" step="1" value="<?php echo esc_attr(intval($settings['throttle_per_minute'] ?? 120)); ?>"></label></td></tr>
+                <tr><th scope="row">Login Brute-Force Limit</th><td><label>Failed attempts: <input type="number" name="login_fail_limit" min="1" step="1" value="<?php echo esc_attr(intval($settings['login_fail_limit'] ?? 5)); ?>"></label><br><label>Block duration (minutes): <input type="number" name="login_block_minutes" min="1" step="1" value="<?php echo esc_attr(intval($settings['login_block_minutes'] ?? 15)); ?>"></label></td></tr>
+            </table>
+
+            <h3>Whitelist</h3>
+            <table class="form-table" role="presentation">
+                <tr><th scope="row">Whitelist IPs</th><td><textarea name="whitelist" rows="5" cols="55" placeholder="One IP per line"><?php echo esc_textarea(implode("\n", (array)$whitelist)); ?></textarea><p class="description">Whitelisted IPs are never blocked and bypass throttles/XML-RPC blocks.</p></td></tr>
+            </table>
+
+            <h3>404 / Probe Blocker</h3>
+            <table class="form-table" role="presentation">
+                <tr><th scope="row">Enable</th><td><label><input type="checkbox" name="probe_enabled" value="1" <?php checked(1, intval($settings['probe_enabled'] ?? 0)); ?>> Block IPs that trigger many 404s quickly</label></td></tr>
+                <tr><th scope="row">Threshold</th><td><input type="number" name="probe_threshold" min="3" step="1" value="<?php echo esc_attr(intval($settings['probe_threshold'] ?? 12)); ?>"> 404s within</td></tr>
+                <tr><th scope="row">Window (minutes)</th><td><input type="number" name="probe_window" min="1" step="1" value="<?php echo esc_attr(intval($settings['probe_window'] ?? 5)); ?>"></td></tr>
+                <tr><th scope="row">Block duration (minutes)</th><td><input type="number" name="probe_block_minutes" min="1" step="1" value="<?php echo esc_attr(intval($settings['probe_block_minutes'] ?? 30)); ?>"></td></tr>
+            </table>
+
+            <h3>Malicious Pattern Filter</h3>
+            <table class="form-table" role="presentation">
+                <tr><th scope="row">Enable</th><td><label><input type="checkbox" name="pattern_enabled" value="1" <?php checked(1, intval($settings['pattern_enabled'] ?? 0)); ?>> Instantly block on obvious exploit strings</label></td></tr>
+                <tr><th scope="row">Block duration (minutes)</th><td><input type="number" name="pattern_block_minutes" min="1" step="1" value="<?php echo esc_attr(intval($settings['pattern_block_minutes'] ?? 60)); ?>"></td></tr>
+                <tr><th scope="row">Additional patterns</th><td><textarea name="pattern_list" rows="5" cols="70" placeholder="One substring per line; case-insensitive. Lines starting with # are ignored."><?php echo esc_textarea($settings['pattern_list'] ?? ''); ?></textarea><p class="description">Defaults include: ../, .env, wp-config, /.git, id_rsa, php://, expect://, base64_decode, union select, information_schema, /etc/passwd …</p></td></tr>
+            </table>
+
+            <h3>REST API</h3>
+            <table class="form-table" role="presentation">
+                <tr><th scope="row">Require Authentication</th><td><label><input type="checkbox" name="lock_rest" value="1" <?php checked(1, intval($settings['lock_rest'] ?? 0)); ?>> Block anonymous REST requests except allowlist</label></td></tr>
+                <tr><th scope="row">Allowlist (regex per line)</th><td><textarea name="rest_allowlist" rows="5" cols="70"><?php echo esc_textarea($settings['rest_allowlist'] ?? "^/oembed/1\.0\n^/wp-site-health\n^/wp/v2/types\n^/wp/v2/taxonomies"); ?></textarea></td></tr>
+            </table>
+
+            <h3>Headers & Cookies</h3>
+            <table class="form-table" role="presentation">
+                <tr><th scope="row">Enable</th><td><label><input type="checkbox" name="headers_enabled" value="1" <?php checked(1, intval($settings['headers_enabled'] ?? 0)); ?>> Send security headers & harden cookies</label></td></tr>
+                <tr><th scope="row">X-Frame-Options</th><td><label><input type="checkbox" name="header_xfo" value="1" <?php checked(1, intval($settings['header_xfo'] ?? 0)); ?>> SAMEORIGIN</label></td></tr>
+                <tr><th scope="row">X-Content-Type-Options</th><td><label><input type="checkbox" name="header_xcto" value="1" <?php checked(1, intval($settings['header_xcto'] ?? 0)); ?>> nosniff</label></td></tr>
+                <tr><th scope="row">Referrer-Policy</th><td><input type="text" name="header_refpol" class="regular-text" value="<?php echo esc_attr($settings['header_refpol'] ?? 'strict-origin-when-cross-origin'); ?>"></td></tr>
+                <tr><th scope="row">CSP (Report-Only)</th><td><label><input type="checkbox" name="csp_report_only" value="1" <?php checked(1, intval($settings['csp_report_only'] ?? 0)); ?>> Send Content-Security-Policy-Report-Only</label><br><textarea name="csp_value" rows="3" cols="70"><?php echo esc_textarea($settings['csp_value'] ?? "default-src 'self' data: blob:; frame-ancestors 'self';"); ?></textarea></td></tr>
+                <tr><th scope="row">Cookie Hardening</th><td><label><input type="checkbox" name="cookie_hardening" value="1" <?php checked(1, intval($settings['cookie_hardening'] ?? 0)); ?>> Enforce Secure/HttpOnly (when SSL) & SameSite=Lax for sessions</label></td></tr>
+                <tr><th scope="row">Disable File Editor</th><td><label><input type="checkbox" name="disable_file_editor" value="1" <?php checked(1, intval($settings['disable_file_editor'] ?? 0)); ?>> Hide built-in theme/plugin editors</label></td></tr>
+            </table>
+
+            <h3>Cloudflare (optional)</h3>
             <table class="form-table" role="presentation">
                 <tr>
-                    <th scope="row">Trust Cloudflare Headers</th>
-                    <td><label><input type="checkbox" name="trust_cloudflare" value="1" <?php checked(1, intval($settings['trust_cloudflare'] ?? 0)); ?>> Use <code>CF-Connecting-IP</code> / <code>X-Forwarded-For</code> for client IP</label></td>
-                </tr>
-                <tr>
-                    <th scope="row">Disable XML-RPC</th>
-                    <td><label><input type="checkbox" name="disable_xmlrpc" value="1" <?php checked(1, intval($settings['disable_xmlrpc'] ?? 0)); ?>> Block all <code>xmlrpc.php</code> requests (except whitelisted IPs)</label></td>
-                </tr>
-                <tr>
-                    <th scope="row">Block Bad/Empty User-Agents</th>
-                    <td><label><input type="checkbox" name="block_bad_ua" value="1" <?php checked(1, intval($settings['block_bad_ua'] ?? 0)); ?>> Immediately block known bad or empty user-agents</label></td>
-                </tr>
-                <tr>
-                    <th scope="row">Global Throttle (optional)</th>
+                    <th scope="row">Edge Blocking</th>
                     <td>
-                        <label><input type="checkbox" name="throttle_all" value="1" <?php checked(1, intval($settings['throttle_all'] ?? 0)); ?>> Throttle all requests per IP (unauthenticated)</label><br>
-                        <label>Requests per minute: <input type="number" name="throttle_per_minute" min="10" step="1" value="<?php echo esc_attr(intval($settings['throttle_per_minute'] ?? 120)); ?>"></label>
-                    </td>
-                </tr>
-                <tr>
-                    <th scope="row">Login Brute-Force Limit</th>
-                    <td>
-                        <label>Failed attempts: <input type="number" name="login_fail_limit" min="1" step="1" value="<?php echo esc_attr(intval($settings['login_fail_limit'] ?? 5)); ?>"></label><br>
-                        <label>Block duration (minutes): <input type="number" name="login_block_minutes" min="1" step="1" value="<?php echo esc_attr(intval($settings['login_block_minutes'] ?? 15)); ?>"></label>
-                    </td>
-                </tr>
-                <tr>
-                    <th scope="row">Whitelist IPs</th>
-                    <td>
-                        <textarea name="whitelist" rows="5" cols="55" placeholder="One IP per line"><?php echo esc_textarea(implode("\n", (array)$whitelist)); ?></textarea>
-                        <p class="description">Whitelisted IPs are never blocked and bypass throttles/XML-RPC blocks.</p>
-                    </td>
-                </tr>
-
-                <tr><th colspan="2"><hr></th></tr>
-
-                <tr>
-                    <th scope="row">Cloudflare Edge Blocking (optional)</th>
-                    <td>
-                        <?php $cf = get_option(LS_OPTION_CF, array()); ?>
                         <label><input type="checkbox" name="cf_enabled" value="1" <?php checked(1, intval($cf['enabled'] ?? 0)); ?>> Push blocks to Cloudflare (IP Access Rules)</label>
                         <p class="description">Requires Zone ID and an API token with permission to edit IP Access Rules for this zone.</p>
                         <p><strong>Token status:</strong> <?php echo !empty($cf['token']) ? '<span style="color:#2271b1;">Saved (hidden)</span>' : '<span style="color:#d63638;">Not set</span>'; ?></p>
                     </td>
                 </tr>
-                <tr>
-                    <th scope="row">Cloudflare Zone ID</th>
-                    <td><input type="text" name="cf_zone_id" class="regular-text" value="<?php echo esc_attr($cf['zone_id'] ?? ''); ?>" placeholder="e.g. 23ab45cdef6789..."></td>
-                </tr>
-                <tr>
-                    <th scope="row">Cloudflare API Token</th>
-                    <td>
-                        <input type="password" name="cf_token" class="regular-text" value="" autocomplete="new-password" placeholder="<?php echo (!empty($cf['token']) ? '****************' : 'Enter token'); ?>">
-                        <label style="margin-left:10px;"><input type="checkbox" name="cf_clear_token" value="1"> Clear stored token</label>
-                        <p class="description">Token should have permission: <code>Zone Firewall Access Rules: Edit</code>. Stored in your WordPress DB. We never display the saved token.</p>
-                    </td>
-                </tr>
+                <tr><th scope="row">Zone ID</th><td><input type="text" name="cf_zone_id" class="regular-text" value="<?php echo esc_attr($cf['zone_id'] ?? ''); ?>" placeholder="e.g. 23ab45cdef6789..."></td></tr>
+                <tr><th scope="row">API Token</th><td><input type="password" name="cf_token" class="regular-text" value="" autocomplete="new-password" placeholder="<?php echo (!empty($cf['token']) ? '****************' : 'Enter token'); ?>"><label style="margin-left:10px;"><input type="checkbox" name="cf_clear_token" value="1"> Clear stored token</label></td></tr>
             </table>
 
             <p>
