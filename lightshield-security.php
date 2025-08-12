@@ -3,7 +3,7 @@
 Plugin Name: LightShield Security
 Description: Lightweight protection against brute force login attempts, bad bots, xmlrpc access, and simple request spikes. Includes IP whitelist/blocklist with a clean admin UI. Optional Cloudflare IP blocking at the edge.
 Version: 1.1.4
-Author: Dragon Society International
+Author: Michael Patrick
 License: GPLv2 or later
 */
 
