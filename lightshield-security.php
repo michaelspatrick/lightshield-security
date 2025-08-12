@@ -2,19 +2,20 @@
 /*
 Plugin Name: LightShield Security
 Description: Lightweight protection against brute force login attempts, bad bots, xmlrpc access, and simple request spikes. Includes IP whitelist/blocklist with a clean admin UI. Optional Cloudflare IP blocking at the edge.
-Version: 1.2.1
+Version: 1.3.0
 Author: Michael Patrick
 License: GPLv2 or later
 */
 
 if (!defined('ABSPATH')) { exit; }
 
-define('LS_VERSION', '1.2.1');
+define('LS_VERSION', '1.3.0');
 define('LS_OPTION_SETTINGS', 'ls_settings');
 define('LS_OPTION_BLOCKLIST', 'ls_blocklist');
 define('LS_OPTION_WHITELIST', 'ls_whitelist');
 define('LS_OPTION_CF', 'ls_cf_settings');
 define('LS_OPTION_CF_MAP', 'ls_cf_map'); // ip => rule_id
+define('LS_OPTION_LOG', 'ls_log');       // activity log (array of entries)
 
 /**
  * Default settings on activation
@@ -56,6 +57,7 @@ register_activation_hook(__FILE__, function () {
     if (!get_option(LS_OPTION_WHITELIST)) { add_option(LS_OPTION_WHITELIST, array()); }
     if (!get_option(LS_OPTION_CF)) { add_option(LS_OPTION_CF, array('enabled'=>0,'zone_id'=>'','token'=>'')); }
     if (!get_option(LS_OPTION_CF_MAP)) { add_option(LS_OPTION_CF_MAP, array()); }
+    if (!get_option(LS_OPTION_LOG)) { add_option(LS_OPTION_LOG, array()); }
 
     if (!wp_next_scheduled('ls_prune_event')) {
         wp_schedule_event(time() + 300, 'hourly', 'ls_prune_event');
@@ -65,6 +67,32 @@ register_deactivation_hook(__FILE__, function () {
     $timestamp = wp_next_scheduled('ls_prune_event');
     if ($timestamp) { wp_unschedule_event($timestamp, 'ls_prune_event'); }
 });
+
+/** Logging */
+function ls_get_server_ua() { return isset($_SERVER['HTTP_USER_AGENT']) ? substr(sanitize_text_field($_SERVER['HTTP_USER_AGENT']),0,300) : ''; }
+function ls_get_server_uri() { return isset($_SERVER['REQUEST_URI']) ? esc_url_raw($_SERVER['REQUEST_URI']) : ''; }
+function ls_log($action, $reason = '', $extra = array()) {
+    $entry = array(
+        'ts'     => time(),
+        'ip'     => ls_get_client_ip(),
+        'action' => sanitize_text_field($action),
+        'reason' => sanitize_text_field($reason),
+        'uri'    => ls_get_server_uri(),
+        'ua'     => ls_get_server_ua(),
+    );
+    if (is_array($extra)) {
+        foreach ($extra as $k=>$v) {
+            if (is_scalar($v)) { $entry['meta_'.sanitize_key($k)] = sanitize_text_field((string)$v); }
+        }
+    }
+    $log = get_option(LS_OPTION_LOG, array());
+    if (!is_array($log)) { $log = array(); }
+    array_unshift($log, $entry);
+    if (count($log) > 1000) { // ring buffer to cap growth
+        $log = array_slice($log, 0, 1000);
+    }
+    update_option(LS_OPTION_LOG, $log, false);
+}
 
 /** Cloudflare helpers */
 function ls_cf_enabled() {
@@ -83,12 +111,13 @@ function ls_cf_http($method, $path, $args = array()) {
     elseif ($method === 'POST') { $response = wp_remote_post($url, $req); }
     else { $req['method'] = $method; $response = wp_remote_request($url, $req); }
 
-    if (is_wp_error($response)) { set_transient('ls_cf_last_error', 'Cloudflare API error: ' . $response->get_error_message(), 300); return false; }
+    if (is_wp_error($response)) { $msg = $response->get_error_message(); set_transient('ls_cf_last_error', 'Cloudflare API error: ' . $msg, 300); ls_log('cf_error', $msg); return false; }
     $code = wp_remote_retrieve_response_code($response);
     $data = json_decode(wp_remote_retrieve_body($response), true);
     if ($code >= 200 && $code < 300 && !empty($data['success'])) { return $data; }
     $msg = !empty($data['errors'][0]['message']) ? $data['errors'][0]['message'] : ('HTTP ' . $code);
     set_transient('ls_cf_last_error', 'Cloudflare API error (' . $code . '): ' . $msg, 300);
+    ls_log('cf_error', $msg, array('http_code'=>$code));
     return false;
 }
 function ls_cf_block_ip($ip, $reason = '') {
@@ -101,6 +130,7 @@ function ls_cf_block_ip($ip, $reason = '') {
         $map = get_option(LS_OPTION_CF_MAP, array());
         $map[$ip] = $data['result']['id'];
         update_option(LS_OPTION_CF_MAP, $map, false);
+        ls_log('cf_block', 'Cloudflare IP block', array('ip'=>$ip,'rule_id'=>$data['result']['id']));
         return $data['result']['id'];
     }
     return false;
@@ -129,6 +159,7 @@ function ls_cf_unblock_ip($ip) {
     $ok = ls_cf_http('DELETE', '/zones/' . rawurlencode($cf['zone_id']) . '/firewall/access_rules/rules/' . rawurlencode($rid));
     if ($ok) {
         if (isset($map[$ip])) { unset($map[$ip]); update_option(LS_OPTION_CF_MAP, $map, false); }
+        ls_log('cf_unblock', 'Cloudflare IP unblock', array('ip'=>$ip,'rule_id'=>$rid));
         return true;
     }
     return false;
@@ -150,6 +181,7 @@ function ls_cf_sync_cleanup() {
             }
         }
     }
+    if ($deleted) { ls_log('cf_cleanup', 'Removed stale LightShield rule(s) at Cloudflare', array('count'=>$deleted)); }
     return $deleted;
 }
 
@@ -163,6 +195,7 @@ function ls_prune_blocklist() {
             if (ls_cf_enabled()) { ls_cf_unblock_ip($ip); }
             unset($blocklist[$ip]);
             $changed = true;
+            ls_log('auto_unblock', 'Block expired', array('ip'=>$ip));
         }
     }
     if ($changed) { update_option(LS_OPTION_BLOCKLIST, $blocklist, false); }
@@ -208,6 +241,7 @@ function ls_is_blocked($ip = null) {
         } else {
             unset($blocklist[$ip]); update_option(LS_OPTION_BLOCKLIST, $blocklist, false);
             if (ls_cf_enabled()) { ls_cf_unblock_ip($ip); }
+            ls_log('auto_unblock', 'Expired/cleanup', array('ip'=>$ip));
         }
     }
     return false;
@@ -219,6 +253,7 @@ function ls_block_ip($ip, $minutes, $reason) {
     $until = time() + max(1, intval($minutes)) * 60;
     $blocklist[$ip] = array('reason'=>sanitize_text_field($reason),'blocked_at'=>time(),'until'=>$until);
     update_option(LS_OPTION_BLOCKLIST, $blocklist, false);
+    ls_log('block', $reason, array('ip'=>$ip,'minutes'=>$minutes,'until'=>$until));
     if (ls_cf_enabled()) { ls_cf_block_ip($ip, $reason); }
     do_action('lightshield_ip_blocked', $ip, $reason, $until);
 }
@@ -236,6 +271,7 @@ add_action('plugins_loaded', function () {
 
     if ($entry = ls_is_blocked($ip)) {
         $mins_left = max(1, floor(($entry['until'] - time())/60));
+        ls_log('deny', 'Blocked IP', array('ip'=>$ip,'minutes_left'=>$mins_left));
         ls_forbid_now('Access denied (' . $entry['reason'] . '). Try again in ~' . $mins_left . ' minute(s).');
     }
 
@@ -243,7 +279,7 @@ add_action('plugins_loaded', function () {
         $is_xmlrpc = false;
         if (defined('XMLRPC_REQUEST') && XMLRPC_REQUEST) { $is_xmlrpc = true; }
         if (isset($_SERVER['REQUEST_URI']) && stripos($_SERVER['REQUEST_URI'], 'xmlrpc.php') !== false) { $is_xmlrpc = true; }
-        if ($is_xmlrpc) { ls_forbid_now('XML-RPC disabled.'); }
+        if ($is_xmlrpc) { ls_log('deny', 'XML-RPC disabled'); ls_forbid_now('XML-RPC disabled.'); }
         add_filter('xmlrpc_enabled', '__return_false');
     }
 
@@ -255,7 +291,7 @@ add_action('plugins_loaded', function () {
         foreach ($patterns as $p) { if ($ua && strpos($ua, $p) !== false) { $bad = true; break; } }
         $allow_if_contains = array('googlebot','bingbot','yandex','duckduckgo','baiduspider');
         foreach ($allow_if_contains as $good) { if ($ua && strpos($ua, $good) !== false) { $bad = false; break; } }
-        if ($bad) { ls_block_ip($ip, 60, 'Bad user-agent'); ls_forbid_now('Bad user-agent.'); }
+        if ($bad) { ls_block_ip($ip, 60, 'Bad user-agent'); ls_log('deny', 'Bad user-agent'); ls_forbid_now('Bad user-agent.'); }
     }
 
     // Malicious pattern filter (URI & query)
@@ -280,6 +316,7 @@ add_action('plugins_loaded', function () {
         foreach ($check as $needle) {
             if ($needle && stripos($hay, $needle) !== false) {
                 ls_block_ip($ip, max(1, intval($settings['pattern_block_minutes'] ?? 60)), 'Malicious pattern');
+                ls_log('deny', 'Malicious pattern');
                 ls_forbid_now('Access denied.');
             }
         }
@@ -298,35 +335,10 @@ add_action('plugins_loaded', function () {
                 if ($count > $limit) {
                     $bmin = max(5, intval($settings['login_block_minutes']));
                     ls_block_ip($ip, $bmin, 'Rate limit exceeded');
+                    ls_log('deny', 'Rate limit exceeded', array('limit'=>$limit,'count'=>$count));
                     ls_forbid_now('Rate limit exceeded.');
                 }
             }
-        }
-    }
-
-    // Harden headers & cookies
-    if (!empty($settings['headers_enabled'])) {
-        add_action('send_headers', function () use ($settings) {
-            if (!headers_sent()) {
-                if (!empty($settings['header_xfo'])) { header('X-Frame-Options: SAMEORIGIN'); }
-                if (!empty($settings['header_xcto'])) { header('X-Content-Type-Options: nosniff'); }
-                if (!empty($settings['header_refpol'])) { header('Referrer-Policy: ' . $settings['header_refpol']); }
-                if (!empty($settings['csp_report_only']) && !empty($settings['csp_value'])) {
-                    header('Content-Security-Policy-Report-Only: ' . $settings['csp_value']);
-                }
-            }
-        }, 2);
-        if (!empty($settings['cookie_hardening'])) {
-            if (function_exists('is_ssl') && is_ssl()) {
-                add_filter('secure_auth_cookie', '__return_true', 999);
-                add_filter('secure_logged_in_cookie', '__return_true', 999);
-            }
-            @ini_set('session.cookie_httponly', '1');
-            @ini_set('session.cookie_secure', is_ssl() ? '1' : '0');
-            if (PHP_VERSION_ID >= 70300) { @ini_set('session.cookie_samesite', 'Lax'); }
-        }
-        if (!empty($settings['disable_file_editor'])) {
-            if (!defined('DISALLOW_FILE_EDIT')) { define('DISALLOW_FILE_EDIT', true); }
         }
     }
 });
@@ -348,6 +360,7 @@ add_filter('rest_authentication_errors', function ($result) {
     foreach ($allow as $pattern) {
         if (@preg_match('~' . $pattern . '~', $route)) { return $result; }
     }
+    ls_log('rest_deny', 'REST API requires authentication', array('route'=>$route));
     return new WP_Error('ls_rest_locked', 'REST API requires authentication.', array('status' => 401));
 }, 10);
 
@@ -362,7 +375,7 @@ add_action('wp_login_failed', function ($username) {
     $fails = get_transient($key);
     if ($fails === false) { $fails = 0; }
     $fails++; set_transient($key, $fails, 15 * 60);
-    if ($fails >= $limit) { ls_block_ip($ip, $block_minutes, 'Too many failed logins'); ls_forbid_now('Too many failed logins.'); }
+    if ($fails >= $limit) { ls_block_ip($ip, $block_minutes, 'Too many failed logins'); ls_log('deny', 'Too many failed logins', array('username'=>$username)); ls_forbid_now('Too many failed logins.'); }
 });
 
 /** 404/probe blocker */
@@ -381,6 +394,7 @@ add_action('template_redirect', function () {
     if ($data >= $th) {
         $mins = max(1, intval($settings['probe_block_minutes'] ?? 30));
         ls_block_ip($ip, $mins, 'Too many 404s/probes');
+        ls_log('deny', 'Too many 404s/probes', array('count'=>$data,'window_min'=>$win));
         ls_forbid_now('Access denied.');
     }
 }, 0);
@@ -392,7 +406,10 @@ function ls_forbid_now($message = '') {
 }
 
 /** Admin UI */
-add_action('admin_menu', function () { add_menu_page('LightShield Security','LightShield','manage_options','lightshield-security','ls_render_admin_page','dashicons-shield-alt',59); });
+add_action('admin_menu', function () {
+    add_menu_page('LightShield Security','LightShield','manage_options','lightshield-security','ls_render_admin_page','dashicons-shield-alt',59);
+    add_submenu_page('lightshield-security','LightShield Log','Log','manage_options','lightshield-security-log','ls_render_log_page');
+});
 
 function ls_admin_post_actions() {
     if (!current_user_can('manage_options')) { return; }
@@ -437,6 +454,7 @@ function ls_admin_post_actions() {
         $settings['disable_file_editor'] = !empty($_POST['disable_file_editor']) ? 1 : 0;
 
         update_option(LS_OPTION_SETTINGS, $settings, false);
+        ls_log('settings_saved', 'Settings updated');
 
         // Whitelist
         $raw = trim( wp_unslash( $_POST['whitelist'] ?? '' ) );
@@ -470,6 +488,7 @@ function ls_admin_post_actions() {
         if (!empty($blocklist[$ip])) {
             unset($blocklist[$ip]); update_option(LS_OPTION_BLOCKLIST, $blocklist, false);
             if (ls_cf_enabled()) { ls_cf_unblock_ip($ip); }
+            ls_log('unblock', 'Manual unblock', array('ip'=>$ip));
             if ($err = get_transient('ls_cf_last_error')) { add_settings_error('ls_messages', 'ls_cf_error', esc_html($err), 'error'); delete_transient('ls_cf_last_error'); }
             add_settings_error('ls_messages', 'ls_ip_unblocked', 'IP unblocked: ' . esc_html($ip), 'updated');
         }
@@ -495,8 +514,10 @@ function ls_admin_post_actions() {
             $rid = ls_cf_block_ip($test_ip, 'LightShield test');
             if ($rid) {
                 ls_cf_unblock_ip($test_ip);
+                ls_log('cf_test_ok', 'Cloudflare API test succeeded');
                 add_settings_error('ls_messages', 'ls_cf_ok', 'Cloudflare API test succeeded.', 'updated');
             } else {
+                ls_log('cf_test_fail', 'Cloudflare API test failed');
                 if ($err = get_transient('ls_cf_last_error')) { add_settings_error('ls_messages', 'ls_cf_error', esc_html($err), 'error'); delete_transient('ls_cf_last_error'); }
                 else { add_settings_error('ls_messages', 'ls_cf_error', 'Cloudflare API test failed.', 'error'); }
             }
@@ -510,6 +531,11 @@ function ls_admin_post_actions() {
             $deleted = ls_cf_sync_cleanup();
             add_settings_error('ls_messages', 'ls_cf_ok', sprintf('Cloudflare sync complete. Removed %d stale LightShield rule(s).', intval($deleted)), 'updated');
         }
+    }
+
+    if ($action === 'clear_log') {
+        update_option(LS_OPTION_LOG, array(), false);
+        add_settings_error('ls_messages', 'ls_log_cleared', 'Activity log cleared.', 'updated');
     }
 }
 add_action('admin_init', 'ls_admin_post_actions');
@@ -647,5 +673,60 @@ function ls_render_admin_page() {
                 <?php wp_nonce_field('ls_save', 'ls_nonce'); ?>
             </p>
         </form>
+    </div>
+<?php }
+
+function ls_render_log_page() {
+    if (!current_user_can('manage_options')) { wp_die('Insufficient permissions'); }
+    $log = get_option(LS_OPTION_LOG, array());
+    if (!is_array($log)) { $log = array(); }
+    $fmt = get_option('date_format') . ' ' . get_option('time_format');
+    $tz  = function_exists('wp_timezone') ? wp_timezone() : null;
+
+    settings_errors('ls_messages'); ?>
+    <div class="wrap">
+        <h1>LightShield Activity Log</h1>
+        <p>Recent security events (latest first). Keeps up to 1000 entries.</p>
+
+        <form method="post" style="margin:10px 0;">
+            <?php wp_nonce_field('ls_save', 'ls_nonce'); ?>
+            <input type="hidden" name="ls_action" value="clear_log">
+            <button class="button" onclick="return confirm('Clear all log entries?');">Clear Log</button>
+        </form>
+
+        <table class="widefat striped">
+            <thead><tr>
+                <th style="width:180px;">When</th>
+                <th style="width:120px;">IP</th>
+                <th style="width:120px;">Action</th>
+                <th>Reason / URI</th>
+                <th>User-Agent</th>
+            </tr></thead>
+            <tbody>
+            <?php if (!empty($log)): foreach ($log as $e): ?>
+                <tr>
+                    <td><?php echo esc_html(function_exists('wp_date')?wp_date($fmt,intval($e['ts']),$tz):date_i18n($fmt,intval($e['ts']))); ?></td>
+                    <td><?php echo esc_html($e['ip'] ?? ''); ?></td>
+                    <td><?php echo esc_html($e['action'] ?? ''); ?></td>
+                    <td>
+                        <?php
+                        $reason = isset($e['reason']) ? $e['reason'] : '';
+                        $uri = isset($e['uri']) ? $e['uri'] : '';
+                        $meta = array();
+                        foreach ($e as $k=>$v) {
+                            if (strpos($k,'meta_')===0 && $v!=='') { $meta[] = esc_html(substr($k,5)) . '=' . esc_html($v); }
+                        }
+                        echo esc_html($reason);
+                        if ($uri) { echo '<br><code>'.esc_html($uri).'</code>'; }
+                        if (!empty($meta)) { echo '<br><small>'.implode(' • ', $meta).'</small>'; }
+                        ?>
+                    </td>
+                    <td><?php echo esc_html($e['ua'] ?? ''); ?></td>
+                </tr>
+            <?php endforeach; else: ?>
+                <tr><td colspan="5">No log entries yet.</td></tr>
+            <?php endif; ?>
+            </tbody>
+        </table>
     </div>
 <?php }

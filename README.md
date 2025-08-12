@@ -1,6 +1,6 @@
 # LightShield Security (WordPress)
 
-**Version:** 1.2.1
+**Version:** 1.3.0
 **Author:** Michael Patrick
 **License:** GPLv2 or later
 
