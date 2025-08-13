@@ -122,33 +122,68 @@ function ls_is_null_ip($ip) {
     return ($ip === '0.0.0.0' || $ip === '::' || $ip === '');
 }
 
+function ls_ip_is_private_or_reserved($ip) {
+    if ($ip === '' || $ip === '0.0.0.0' || $ip === '::') return true;
+    // If it's NOT a valid public IP, filter_var returns false when we say "must be public"
+    return filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) === false;
+}
+
 /**
  * Helper: get client IP (Cloudflare-aware if enabled)
  * @param bool $log_fail Whether to log failures (default true)
  */
-function ls_get_client_ip($log_fail = true) {
+function ls_get_client_ip() {
     $settings = get_option(LS_OPTION_SETTINGS, array());
-    $cand = array();
-    if (!empty($settings['trust_cloudflare'])) {
-        if (!empty($_SERVER['HTTP_CF_CONNECTING_IP'])) { $cand[] = $_SERVER['HTTP_CF_CONNECTING_IP']; }
-        if (!empty($_SERVER['HTTP_X_REAL_IP'])) { $cand[] = $_SERVER['HTTP_X_REAL_IP']; }
-        if (!empty($_SERVER['HTTP_X_FORWARDED_FOR'])) { $cand[] = $_SERVER['HTTP_X_FORWARDED_FOR']; }
-    }
-    if (!empty($_SERVER['REMOTE_ADDR'])) { $cand[] = $_SERVER['REMOTE_ADDR']; }
 
-    foreach ($cand as $raw) {
-        $ip = ls_normalize_ip($raw);
-        if ($ip && filter_var($ip, FILTER_VALIDATE_IP)) { return $ip; }
+    $remote = isset($_SERVER['REMOTE_ADDR']) ? trim($_SERVER['REMOTE_ADDR']) : '';
+    $cands  = array();
+
+    // 1) Cloudflare (most reliable when proxied by CF)
+    if (!empty($settings['trust_cloudflare'])) {
+        if (!empty($_SERVER['HTTP_CF_CONNECTING_IP'])) {
+            $cands[] = trim($_SERVER['HTTP_CF_CONNECTING_IP']);
+        }
     }
-    if ($log_fail) {
-        ls_log('ip_resolve_fail', 'Could not determine client IP', array(
-            'cf_ip' => isset($_SERVER['HTTP_CF_CONNECTING_IP']) ? $_SERVER['HTTP_CF_CONNECTING_IP'] : '',
-            'xff'   => isset($_SERVER['HTTP_X_FORWARDED_FOR']) ? $_SERVER['HTTP_X_FORWARDED_FOR'] : '',
-            'xri'   => isset($_SERVER['HTTP_X_REAL_IP']) ? $_SERVER['HTTP_X_REAL_IP'] : '',
-            'ra'    => isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : '',
-            '_ip'   => '0.0.0.0',
-        ));
+
+    // 2) If our direct peer looks like a proxy (private/reserved),
+    //    allow common proxy headers (in a safe order)
+    $peer_looks_proxy = ls_ip_is_private_or_reserved($remote);
+
+    if ($peer_looks_proxy) {
+        // X-Real-IP (typical with nginx/haproxy)
+        if (!empty($_SERVER['HTTP_X_REAL_IP'])) {
+            $cands[] = trim($_SERVER['HTTP_X_REAL_IP']);
+        }
+
+        // X-Forwarded-For: left-most is original client; walk until we find a public/valid IP
+        if (!empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
+            foreach (preg_split('/\s*,\s*/', $_SERVER['HTTP_X_FORWARDED_FOR']) as $part) {
+                $part = trim($part);
+                // ignore "unknown" or garbage
+                if ($part !== '' && strtolower($part) !== 'unknown') { $cands[] = $part; }
+            }
+        }
+
+        // RFC 7239 Forwarded: for=client, for=...; we’ll try to extract the first "for="
+        if (!empty($_SERVER['HTTP_FORWARDED'])) {
+            // Example: for=192.0.2.60;proto=https;by=203.0.113.43
+            $f = $_SERVER['HTTP_FORWARDED'];
+            if (preg_match_all('/for=(?:\[?)([a-fA-F0-9\.:]+)(?:\]?)/', $f, $m)) {
+                foreach ($m[1] as $ip) { $cands[] = $ip; }
+            }
+        }
     }
+
+    // 3) Finally, whatever PHP thinks the peer is
+    if ($remote !== '') { $cands[] = $remote; }
+
+    // Validate and return the first sane candidate
+    foreach ($cands as $ip) {
+        $ip = trim($ip, " \t\n\r\0\x0B\"'"); // strip quotes if any
+        if (ls_is_null_ip($ip)) { continue; }
+        if (filter_var($ip, FILTER_VALIDATE_IP)) { return $ip; }
+    }
+
     return '0.0.0.0';
 }
 
@@ -321,8 +356,12 @@ add_action('plugins_loaded', function () {
 
     // If IP couldn't be determined, do not evaluate block status or protections
     if (ls_is_null_ip($ip)) {
-        ls_log('ip_resolve_fail', 'Could not determine client IP');
-        return; // <— IMPORTANT: skip all further checks so no "Blocked IP" deny fires
+        // Log at most once every 10 minutes to avoid noise
+        if (!get_transient('ls_ipfail_once')) {
+            ls_log('ip_resolve_fail', 'Could not determine client IP');
+            set_transient('ls_ipfail_once', 1, 10 * 60);
+        }
+        return; // skip further checks
     }
 
     // Quick prune tick
