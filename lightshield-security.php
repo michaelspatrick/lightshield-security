@@ -118,6 +118,10 @@ function ls_normalize_ip($raw) {
     return $v;
 }
 
+function ls_is_null_ip($ip) {
+    return ($ip === '0.0.0.0' || $ip === '::' || $ip === '');
+}
+
 /**
  * Helper: get client IP (Cloudflare-aware if enabled)
  * @param bool $log_fail Whether to log failures (default true)
@@ -245,6 +249,14 @@ function ls_prune_blocklist() {
     $changed = false;
     $now = time();
     foreach ($blocklist as $ip => $entry) {
+        // Remove invalid IP keys lingering from earlier versions/misconfigs
+        if (ls_is_null_ip($ip) || !filter_var($ip, FILTER_VALIDATE_IP)) {
+            unset($blocklist[$ip]);
+            $changed = true;
+            ls_log('cleanup', 'Removed invalid IP from blocklist', array('ip' => $ip));
+            continue;
+        }
+
         if (empty($entry['until']) || $now >= intval($entry['until'])) {
             if (ls_cf_enabled()) { ls_cf_unblock_ip($ip); }
             unset($blocklist[$ip]);
@@ -264,6 +276,8 @@ function ls_is_whitelisted($ip = null) {
 }
 function ls_is_blocked($ip = null) {
     if ($ip === null) { $ip = ls_get_client_ip(); }
+    if (ls_is_null_ip($ip)) { return false; } // never treat 0.0.0.0/:: as blocked
+
     $blocklist = get_option(LS_OPTION_BLOCKLIST, array());
     if (isset($blocklist[$ip])) {
         $entry = $blocklist[$ip];
@@ -278,6 +292,11 @@ function ls_is_blocked($ip = null) {
     return false;
 }
 function ls_block_ip($ip, $minutes, $reason) {
+    if (ls_is_null_ip($ip)) {
+       ls_log('skip_block', 'Unresolved IP', array('ip' => $ip));
+       return;
+    }
+
     if ($ip === '0.0.0.0' || $ip === '::' || $ip === '') {
         ls_log('skip_block', 'Unresolved IP', array('ip'=>$ip));
         return;
@@ -299,6 +318,12 @@ function ls_block_ip($ip, $minutes, $reason) {
 add_action('plugins_loaded', function () {
     $settings = get_option(LS_OPTION_SETTINGS, array());
     $ip = ls_get_client_ip();
+
+    // If IP couldn't be determined, do not evaluate block status or protections
+    if (ls_is_null_ip($ip)) {
+        ls_log('ip_resolve_fail', 'Could not determine client IP');
+        return; // <— IMPORTANT: skip all further checks so no "Blocked IP" deny fires
+    }
 
     // Quick prune tick
     $k = 'ls_prune_tick';
@@ -365,6 +390,13 @@ add_action('plugins_loaded', function () {
 
     // Global throttle (optional)
     if (!empty($settings['throttle_all'])) {
+        $ip = ls_get_client_ip();
+        if (ls_is_null_ip($ip)) {
+            ls_log('throttle_skip', 'Null IP');
+            // and make sure you DON'T touch transients keyed on this IP
+            return;
+        }
+
         if (!is_user_logged_in() || !current_user_can('manage_options')) {
             $limit = intval($settings['throttle_per_minute']);
             if ($limit > 0) {
@@ -386,6 +418,11 @@ add_action('plugins_loaded', function () {
 
 /** REST API lock: require auth except allowlist */
 add_filter('rest_authentication_errors', function ($result) {
+    $ip = ls_get_client_ip();
+    if (ls_is_null_ip($ip)) {
+        ls_log('rest_skip', 'Null IP');
+        return $result; // allow normal REST flow; don't 401/deny
+    }
     $settings = get_option(LS_OPTION_SETTINGS, array());
     if (empty($settings['lock_rest'])) { return $result; }
     if (is_user_logged_in()) { return $result; }
@@ -408,6 +445,10 @@ add_filter('rest_authentication_errors', function ($result) {
 /** Brute-force protection */
 add_action('wp_login_failed', function ($username) {
     $ip = ls_get_client_ip();
+    if (ls_is_null_ip($ip)) {
+        ls_log('skip_login_fail', 'Null IP');
+        return; // do not count or block
+    }
     if (ls_is_whitelisted($ip)) { return; }
     $settings = get_option(LS_OPTION_SETTINGS, array());
     $limit = max(1, intval($settings['login_fail_limit'] ?? 5));
@@ -424,6 +465,10 @@ add_action('template_redirect', function () {
     $settings = get_option(LS_OPTION_SETTINGS, array());
     if (empty($settings['probe_enabled']) || !is_404()) { return; }
     $ip = ls_get_client_ip();
+    if (ls_is_null_ip($ip)) {
+        ls_log('probe_skip', 'Null IP');
+        return; // don't increment counters or block
+    }
     if (ls_is_whitelisted($ip)) { return; }
     $win = max(1, intval($settings['probe_window'] ?? 5));
     $th  = max(1, intval($settings['probe_threshold'] ?? 12));
