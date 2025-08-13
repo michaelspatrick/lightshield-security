@@ -2,14 +2,14 @@
 /*
 Plugin Name: LightShield Security
 Description: Lightweight protection against brute force login attempts, bad bots, xmlrpc access, and simple request spikes. Includes IP whitelist/blocklist with a clean admin UI. Optional Cloudflare IP blocking at the edge.
-Version: 1.3.0
-Author: Michael Patrick
+Version: 1.3.1
+Author: Dragon Society International
 License: GPLv2 or later
 */
 
 if (!defined('ABSPATH')) { exit; }
 
-define('LS_VERSION', '1.3.0');
+define('LS_VERSION', '1.3.1');
 define('LS_OPTION_SETTINGS', 'ls_settings');
 define('LS_OPTION_BLOCKLIST', 'ls_blocklist');
 define('LS_OPTION_WHITELIST', 'ls_whitelist');
@@ -74,7 +74,7 @@ function ls_get_server_uri() { return isset($_SERVER['REQUEST_URI']) ? esc_url_r
 function ls_log($action, $reason = '', $extra = array()) {
     $entry = array(
         'ts'     => time(),
-        'ip'     => ls_get_client_ip(),
+        'ip'     => isset($extra['_ip']) ? $extra['_ip'] : ls_get_client_ip(false),
         'action' => sanitize_text_field($action),
         'reason' => sanitize_text_field($reason),
         'uri'    => ls_get_server_uri(),
@@ -82,16 +82,70 @@ function ls_log($action, $reason = '', $extra = array()) {
     );
     if (is_array($extra)) {
         foreach ($extra as $k=>$v) {
+            if ($k === '_ip') { continue; }
             if (is_scalar($v)) { $entry['meta_'.sanitize_key($k)] = sanitize_text_field((string)$v); }
         }
     }
     $log = get_option(LS_OPTION_LOG, array());
     if (!is_array($log)) { $log = array(); }
     array_unshift($log, $entry);
-    if (count($log) > 1000) { // ring buffer to cap growth
-        $log = array_slice($log, 0, 1000);
-    }
+    if (count($log) > 1000) { $log = array_slice($log, 0, 1000); }
     update_option(LS_OPTION_LOG, $log, false);
+}
+
+/** IP normalization */
+function ls_normalize_ip($raw) {
+    if (!is_string($raw) || $raw === '') { return ''; }
+    $v = trim($raw);
+    // If list (XFF), take first
+    if (strpos($v, ',') !== false) {
+        $parts = explode(',', $v);
+        $v = trim($parts[0]);
+    }
+    // IPv6 in brackets with optional port: [::1]:1234
+    if (preg_match('/^\[([0-9a-fA-F:]+)\](?::\d+)?$/', $v, $m)) {
+        $v = $m[1];
+    } else {
+        // IPv4:port -> strip port
+        if (strpos($v, '.') !== false && preg_match('/^(\d{1,3}(?:\.\d{1,3}){3})(?::\d+)?$/', $v, $m)) {
+            $v = $m[1];
+        }
+        // IPv6-mapped IPv4 ::ffff:1.2.3.4
+        if (preg_match('/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i', $v, $m)) {
+            $v = $m[1];
+        }
+    }
+    return $v;
+}
+
+/**
+ * Helper: get client IP (Cloudflare-aware if enabled)
+ * @param bool $log_fail Whether to log failures (default true)
+ */
+function ls_get_client_ip($log_fail = true) {
+    $settings = get_option(LS_OPTION_SETTINGS, array());
+    $cand = array();
+    if (!empty($settings['trust_cloudflare'])) {
+        if (!empty($_SERVER['HTTP_CF_CONNECTING_IP'])) { $cand[] = $_SERVER['HTTP_CF_CONNECTING_IP']; }
+        if (!empty($_SERVER['HTTP_X_REAL_IP'])) { $cand[] = $_SERVER['HTTP_X_REAL_IP']; }
+        if (!empty($_SERVER['HTTP_X_FORWARDED_FOR'])) { $cand[] = $_SERVER['HTTP_X_FORWARDED_FOR']; }
+    }
+    if (!empty($_SERVER['REMOTE_ADDR'])) { $cand[] = $_SERVER['REMOTE_ADDR']; }
+
+    foreach ($cand as $raw) {
+        $ip = ls_normalize_ip($raw);
+        if ($ip && filter_var($ip, FILTER_VALIDATE_IP)) { return $ip; }
+    }
+    if ($log_fail) {
+        ls_log('ip_resolve_fail', 'Could not determine client IP', array(
+            'cf_ip' => isset($_SERVER['HTTP_CF_CONNECTING_IP']) ? $_SERVER['HTTP_CF_CONNECTING_IP'] : '',
+            'xff'   => isset($_SERVER['HTTP_X_FORWARDED_FOR']) ? $_SERVER['HTTP_X_FORWARDED_FOR'] : '',
+            'xri'   => isset($_SERVER['HTTP_X_REAL_IP']) ? $_SERVER['HTTP_X_REAL_IP'] : '',
+            'ra'    => isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : '',
+            '_ip'   => '0.0.0.0',
+        ));
+    }
+    return '0.0.0.0';
 }
 
 /** Cloudflare helpers */
@@ -202,29 +256,6 @@ function ls_prune_blocklist() {
 }
 add_action('ls_prune_event', 'ls_prune_blocklist');
 
-/**
- * Helper: get client IP (Cloudflare-aware if enabled)
- */
-function ls_get_client_ip() {
-    $settings = get_option(LS_OPTION_SETTINGS, array());
-    $candidates = array();
-
-    if (!empty($settings['trust_cloudflare'])) {
-        if (!empty($_SERVER['HTTP_CF_CONNECTING_IP'])) { $candidates[] = $_SERVER['HTTP_CF_CONNECTING_IP']; }
-        if (!empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
-            $parts = explode(',', $_SERVER['HTTP_X_FORWARDED_FOR']);
-            if (!empty($parts)) { $candidates[] = trim($parts[0]); }
-        }
-    }
-    if (!empty($_SERVER['REMOTE_ADDR'])) { $candidates[] = $_SERVER['REMOTE_ADDR']; }
-
-    foreach ($candidates as $ip) {
-        $ip = trim($ip);
-        if (filter_var($ip, FILTER_VALIDATE_IP)) { return $ip; }
-    }
-    return '0.0.0.0';
-}
-
 /** Blocklist helpers */
 function ls_is_whitelisted($ip = null) {
     if ($ip === null) { $ip = ls_get_client_ip(); }
@@ -247,6 +278,12 @@ function ls_is_blocked($ip = null) {
     return false;
 }
 function ls_block_ip($ip, $minutes, $reason) {
+    if ($ip === '0.0.0.0' || $ip === '::' || $ip === '') {
+        ls_log('skip_block', 'Unresolved IP', array('ip'=>$ip));
+        return;
+    }
+    if (!filter_var($ip, FILTER_VALIDATE_IP)) { return; }
+    if (ls_is_whitelisted($ip)) { return; }
     if (!filter_var($ip, FILTER_VALIDATE_IP)) { return; }
     if (ls_is_whitelisted($ip)) { return; }
     $blocklist = get_option(LS_OPTION_BLOCKLIST, array());
@@ -289,7 +326,10 @@ add_action('plugins_loaded', function () {
         if ($ua === '' || $ua === '-') { $bad = true; }
         $patterns = array('sqlmap','acunetix','nikto','nessus','wpscanner','wpscan','curl','python-requests','libwww-perl','masscan','apachebench','scrapy','httpclient','winhttp','botnet','spammer');
         foreach ($patterns as $p) { if ($ua && strpos($ua, $p) !== false) { $bad = true; break; } }
-        $allow_if_contains = array('googlebot','bingbot','yandex','duckduckgo','baiduspider');
+        $allow_if_contains = array('googlebot','applebot','bingbot','yandex','duckduckgo','baiduspider','slurp','yandexbot','ahrefsbot','semrushbot','mj12bot','facebookexternalhit',
+                                   'twitterbot','linkedinbot','slackbot','pinterestbot','pingdom.com_bot','uptimerobot','betterstackbot','cron-job.org','gptbot','chatgpt-user',
+                                   'claudebot','anthropic-ai','perplexitybot','censys.io','shodan','bitsightbot'
+                                  );
         foreach ($allow_if_contains as $good) { if ($ua && strpos($ua, $good) !== false) { $bad = false; break; } }
         if ($bad) { ls_block_ip($ip, 60, 'Bad user-agent'); ls_log('deny', 'Bad user-agent'); ls_forbid_now('Bad user-agent.'); }
     }
@@ -697,7 +737,7 @@ function ls_render_log_page() {
         <table class="widefat striped">
             <thead><tr>
                 <th style="width:180px;">When</th>
-                <th style="width:120px;">IP</th>
+                <th style="width:160px;">IP</th>
                 <th style="width:120px;">Action</th>
                 <th>Reason / URI</th>
                 <th>User-Agent</th>
