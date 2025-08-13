@@ -128,6 +128,29 @@ function ls_ip_is_private_or_reserved($ip) {
     return filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) === false;
 }
 
+function ls_is_internal_task() {
+    // WordPress cron or PHP CLI (incl. WP-CLI)
+    if ((defined('DOING_CRON') && DOING_CRON) || (defined('WP_CLI') && WP_CLI) || php_sapi_name() === 'cli') {
+        return true;
+    }
+
+    // Direct hit to wp-cron.php (real cron using curl/wget)
+    $uri = isset($_SERVER['REQUEST_URI']) ? $_SERVER['REQUEST_URI'] : '';
+    if ($uri && strpos($uri, '/wp-cron.php') !== false) { return true; }
+
+    // Localhost loopback with no CF header (typical server cron or health check)
+    $remote = isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : '';
+    if (($remote === '127.0.0.1' || $remote === '::1') && empty($_SERVER['HTTP_CF_CONNECTING_IP'])) {
+        return true;
+    }
+
+    // Optional: allow an explicit header from your cron job:
+    // curl -H "X-LS-Internal: 1" https://example.com/wp-cron.php?doing_wp_cron=1
+    if (!empty($_SERVER['HTTP_X_LS_INTERNAL'])) { return true; }
+
+    return false;
+}
+
 /**
  * Helper: get client IP (Cloudflare-aware if enabled)
  * @param bool $log_fail Whether to log failures (default true)
@@ -327,6 +350,7 @@ function ls_is_blocked($ip = null) {
     return false;
 }
 function ls_block_ip($ip, $minutes, $reason) {
+    if (ls_is_internal_task()) { return; }  // don't ever block internal tasks
     if (ls_is_null_ip($ip)) {
        ls_log('skip_block', 'Unresolved IP', array('ip' => $ip));
        return;
@@ -351,6 +375,8 @@ function ls_block_ip($ip, $minutes, $reason) {
 
 /** Early request guard + protections */
 add_action('plugins_loaded', function () {
+    if (ls_is_internal_task()) { return; }
+
     $settings = get_option(LS_OPTION_SETTINGS, array());
     $ip = ls_get_client_ip();
 
@@ -457,6 +483,7 @@ add_action('plugins_loaded', function () {
 
 /** REST API lock: require auth except allowlist */
 add_filter('rest_authentication_errors', function ($result) {
+    if (ls_is_internal_task()) { return $result; }  // do nothing special
     $ip = ls_get_client_ip();
     if (ls_is_null_ip($ip)) {
         ls_log('rest_skip', 'Null IP');
@@ -483,6 +510,7 @@ add_filter('rest_authentication_errors', function ($result) {
 
 /** Brute-force protection */
 add_action('wp_login_failed', function ($username) {
+    if (ls_is_internal_task()) { return; }  // skip cron/localhost
     $ip = ls_get_client_ip();
     if (ls_is_null_ip($ip)) {
         ls_log('skip_login_fail', 'Null IP');
@@ -501,6 +529,7 @@ add_action('wp_login_failed', function ($username) {
 
 /** 404/probe blocker */
 add_action('template_redirect', function () {
+    if (ls_is_internal_task()) { return; }  // don't count or block
     $settings = get_option(LS_OPTION_SETTINGS, array());
     if (empty($settings['probe_enabled']) || !is_404()) { return; }
     $ip = ls_get_client_ip();
