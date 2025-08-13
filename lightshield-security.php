@@ -324,13 +324,14 @@ add_action('plugins_loaded', function () {
         $ua = isset($_SERVER['HTTP_USER_AGENT']) ? strtolower($_SERVER['HTTP_USER_AGENT']) : '';
         $bad = false;
         if ($ua === '' || $ua === '-') { $bad = true; }
-        $patterns = array('sqlmap','acunetix','nikto','nessus','wpscanner','wpscan','curl','python-requests','libwww-perl','masscan','apachebench','scrapy','httpclient','winhttp','botnet','spammer');
-        foreach ($patterns as $p) { if ($ua && strpos($ua, $p) !== false) { $bad = true; break; } }
+        $patterns = array('sqlmap','acunetix','nikto','nessus','wpscanner','wpscan','curl','python-requests','libwww-perl','masscan','apachebench','scrapy','httpclient',
+                          'winhttp','botnet','spammer');
+        foreach ($patterns as $p) { if ($ua && stripos($ua, $p) !== false) { $bad = true; break; } }
         $allow_if_contains = array('googlebot','applebot','bingbot','yandex','duckduckgo','baiduspider','slurp','yandexbot','ahrefsbot','semrushbot','mj12bot','facebookexternalhit',
                                    'twitterbot','linkedinbot','slackbot','pinterestbot','pingdom.com_bot','uptimerobot','betterstackbot','cron-job.org','gptbot','chatgpt-user',
                                    'claudebot','anthropic-ai','perplexitybot','censys.io','shodan','bitsightbot'
                                   );
-        foreach ($allow_if_contains as $good) { if ($ua && strpos($ua, $good) !== false) { $bad = false; break; } }
+        foreach ($allow_if_contains as $good) { if ($ua && stripos($ua, $good) !== false) { $bad = false; break; } }
         if ($bad) { ls_block_ip($ip, 60, 'Bad user-agent'); ls_log('deny', 'Bad user-agent'); ls_forbid_now('Bad user-agent.'); }
     }
 
