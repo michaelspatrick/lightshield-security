@@ -354,7 +354,7 @@ add_action('plugins_loaded', function () {
         foreach ($patterns as $p) { if ($ua && stripos($ua, $p) !== false) { $bad = true; break; } }
         $allow_if_contains = array('googlebot','applebot','bingbot','yandex','duckduckgo','baiduspider','slurp','yandexbot','ahrefsbot','semrushbot','mj12bot','facebookexternalhit',
                                    'twitterbot','linkedinbot','slackbot','pinterestbot','pingdom.com_bot','uptimerobot','betterstackbot','cron-job.org','gptbot','chatgpt-user',
-                                   'claudebot','anthropic-ai','perplexitybot','censys.io','shodan','bitsightbot'
+                                   'claudebot','anthropic-ai','perplexitybot','censys.io','shodan','bitsightbot','jetpack'
                                   );
         foreach ($allow_if_contains as $good) { if ($ua && stripos($ua, $good) !== false) { $bad = false; break; } }
         if ($bad) { ls_block_ip($ip, 60, 'Bad user-agent'); ls_log('deny', 'Bad user-agent'); ls_forbid_now('Bad user-agent.'); }
@@ -816,3 +816,8 @@ function ls_render_log_page() {
         </table>
     </div>
 <?php }
+
+// Load the stats dashboard (admin only)
+if (is_admin() && file_exists(__DIR__ . '/lightshield-dashboard.php')) {
+    require_once __DIR__ . '/lightshield-dashboard.php';
+}
