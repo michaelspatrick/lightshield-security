@@ -196,8 +196,8 @@ function ls_render_stats_dashboard() {
             </div>
         </div>
 
-        <div class="ls-grid" style="margin-top:16px;">
-            <div class="ls-canvas-wrap">
+        <div class="ls-row" style="margin-top:16px;">
+            <div class="ls-col-50">
                 <h2 style="margin-top:0;">Top Paths (denied)</h2>
                 <table class="widefat striped ls-table">
                     <thead><tr><th>URI</th><th style="width:90px;">Count</th></tr></thead>
@@ -210,7 +210,10 @@ function ls_render_stats_dashboard() {
                     </tbody>
                 </table>
             </div>
-            <div class="ls-canvas-wrap">
+        </div>
+
+        <div class="ls-row" style="margin-top:16px;">
+            <div class="ls-col-50">
                 <h2 style="margin-top:0;">Top User-Agents (denied)</h2>
                 <table class="widefat striped ls-table">
                     <thead><tr><th>User-Agent</th><th style="width:90px;">Count</th></tr></thead>
@@ -295,4 +298,5 @@ $init_js = <<<JS
 JS;
 wp_add_inline_script('ls-dashboard-init', $init_js, 'after');
 }
+
 

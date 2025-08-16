@@ -1,7 +1,7 @@
 # LightShield Security (WordPress)
 _A fast, lightweight shield for WordPress that plays nicely with Cloudflare._
 
-**Current version:** 1.3.1  
+**Current version:** 1.4.2
 **License:** GPLv2 or later
 
 LightShield focuses on the highest-impact protections with a clean UI:

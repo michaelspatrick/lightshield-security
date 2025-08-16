@@ -2,7 +2,7 @@
 /*
 Plugin Name: LightShield Security
 Description: Lightweight protection against brute force login attempts, bad bots, xmlrpc access, and simple request spikes. Includes IP whitelist/blocklist with a clean admin UI. Optional Cloudflare IP blocking at the edge.
-Version: 1.3.1
+Version: 1.4.2
 Author: Dragon Society International
 License: GPLv2 or later
 */
@@ -13,6 +13,9 @@ define('LS_VERSION', '1.3.1');
 define('LS_OPTION_SETTINGS', 'ls_settings');
 define('LS_OPTION_BLOCKLIST', 'ls_blocklist');
 define('LS_OPTION_WHITELIST', 'ls_whitelist');
+
+// Load consolidated network helpers (CIDR whitelist, IP tools, admin notice)
+if ( file_exists(__DIR__ . '/includes/ls-net.php') ) { require_once __DIR__ . '/includes/ls-net.php'; }
 define('LS_OPTION_CF', 'ls_cf_settings');
 define('LS_OPTION_CF_MAP', 'ls_cf_map'); // ip => rule_id
 define('LS_OPTION_LOG', 'ls_log');       // activity log (array of entries)
@@ -329,8 +332,16 @@ add_action('ls_prune_event', 'ls_prune_blocklist');
 /** Blocklist helpers */
 function ls_is_whitelisted($ip = null) {
     if ($ip === null) { $ip = ls_get_client_ip(); }
-    $wl = get_option(LS_OPTION_WHITELIST, array());
-    return in_array($ip, (array)$wl, true);
+    if (ls_is_null_ip($ip)) { return false; }
+    if (!function_exists('ls_whitelist_cidrs') || !function_exists('ls_ip_in_cidr')) {
+        // Fallback to old behavior
+        $wl = get_option(LS_OPTION_WHITELIST, array());
+        return in_array($ip, (array)$wl, true);
+    }
+    foreach (ls_whitelist_cidrs() as $cidr) {
+        if (ls_ip_in_cidr($ip, $cidr)) { return true; }
+    }
+    return false;
 }
 function ls_is_blocked($ip = null) {
     if ($ip === null) { $ip = ls_get_client_ip(); }
@@ -489,6 +500,9 @@ add_filter('rest_authentication_errors', function ($result) {
         ls_log('rest_skip', 'Null IP');
         return $result; // allow normal REST flow; don't 401/deny
     }
+    // Allow whitelisted IPs to bypass REST lock
+    if (ls_is_whitelisted($ip)) { return $result; }
+
     $settings = get_option(LS_OPTION_SETTINGS, array());
     if (empty($settings['lock_rest'])) { return $result; }
     if (is_user_logged_in()) { return $result; }
@@ -610,16 +624,24 @@ function ls_admin_post_actions() {
         update_option(LS_OPTION_SETTINGS, $settings, false);
         ls_log('settings_saved', 'Settings updated');
 
-        // Whitelist
+        // Whitelist (accept single IPs or CIDR; store explicit CIDRs)
         $raw = trim( wp_unslash( $_POST['whitelist'] ?? '' ) );
-        $wl = array();
+        $wl  = array();
         foreach (preg_split('/\r\n|\r|\n/', $raw) as $line) {
-            $ip = trim($line);
-            if ($ip !== '' && filter_var($ip, FILTER_VALIDATE_IP)) { $wl[] = $ip; }
+            $item = function_exists('ls_normalize_cidr') ? ls_normalize_cidr($line) : trim($line);
+            if ($item === '') continue;
+            // accept bare IP or CIDR
+            if (function_exists('ls_cidr_is_valid') && function_exists('ls_cidr_to_explicit')) {
+                if (!ls_cidr_is_valid($item)) continue;
+                $explicit = ls_cidr_to_explicit($item);
+                if ($explicit && ls_cidr_is_valid($explicit)) { $wl[$explicit] = true; }
+            } else {
+                if (filter_var($item, FILTER_VALIDATE_IP)) { $wl[$item] = true; }
+            }
         }
-        update_option(LS_OPTION_WHITELIST, array_values(array_unique($wl)), false);
+        update_option(LS_OPTION_WHITELIST, array_keys($wl), false);
 
-        // Cloudflare settings
+        // Cloudflare settings// Cloudflare settings
         $cf = get_option(LS_OPTION_CF, array());
         $cf['enabled'] = !empty($_POST['cf_enabled']) ? 1 : 0;
         $cf['zone_id'] = sanitize_text_field( wp_unslash( $_POST['cf_zone_id'] ?? '' ) );
@@ -832,60 +854,187 @@ function ls_render_admin_page() {
 
 function ls_render_log_page() {
     if (!current_user_can('manage_options')) { wp_die('Insufficient permissions'); }
+
+    // Pull ring buffer (latest-first for display)
     $log = get_option(LS_OPTION_LOG, array());
     if (!is_array($log)) { $log = array(); }
+    $entries = array_reverse($log);
+
+    // Date formatting
     $fmt = get_option('date_format') . ' ' . get_option('time_format');
     $tz  = function_exists('wp_timezone') ? wp_timezone() : null;
 
-    settings_errors('ls_messages'); ?>
+    ?>
     <div class="wrap">
         <h1>LightShield Activity Log</h1>
-        <p>Recent security events (latest first). Keeps up to 1000 entries.</p>
+        <p>Search, sort, and paginate recent events. Keeps up to 1000 entries.</p>
 
-        <form method="post" style="margin:10px 0;">
+        <table id="ls-log-table" class="widefat striped">
+            <thead>
+            <tr>
+                <th style="display:none;">ts</th>
+                <th class="when-col">When</th>
+                <th>IP</th>
+                <th>Action</th>
+                <th>Reason / URI</th>
+                <th>User-Agent</th>
+            </tr>
+            </thead>
+            <tbody>
+            <?php foreach ($entries as $e):
+                $ts = !empty($e['ts']) ? (int)$e['ts'] : 0;
+                $when = $ts ? (function_exists('wp_date') ? wp_date($fmt, $ts, $tz) : date_i18n($fmt, $ts)) : '—';
+                $ip = $e['ip'] ?? '';
+                $act = $e['action'] ?? '';
+                $reason = $e['reason'] ?? '';
+                $uri = $e['uri'] ?? '';
+                $ua  = $e['ua'] ?? '';
+                $metaBits = array();
+                if (!empty($e['country'])) $metaBits[] = 'CC: ' . $e['country'];
+                if (!empty($e['asn']))     $metaBits[] = 'ASN: ' . $e['asn'];
+                if (!empty($e['edge']))    $metaBits[] = 'Edge: ' . $e['edge'];
+                ?>
+                <tr>
+                    <!-- hidden unix ts used for correct sorting -->
+                    <td style="display:none;"><?php echo esc_html($ts); ?></td>
+                    <td class="when-col"><code><?php echo esc_html($when); ?></code></td>
+                    <td class="ip-col"><code><?php echo esc_html($ip); ?></code></td>
+                    <td><?php echo esc_html($act); ?></td>
+                    <td>
+                        <?php if ($reason !== ''): ?>
+                            <div><strong><?php echo esc_html($reason); ?></strong></div>
+                        <?php endif; ?>
+                        <?php if ($uri !== ''): ?>
+                            <div class="ls-muted"><code><?php echo esc_html($uri); ?></code></div>
+                        <?php endif; ?>
+                        <?php if (!empty($metaBits)): ?>
+                            <div class="ls-muted" style="margin-top:2px;"><small><?php echo esc_html(implode(' • ', $metaBits)); ?></small></div>
+                        <?php endif; ?>
+                    </td>
+                    <td><div overflow-wrap:anywhere;"><?php echo esc_html($ua); ?></div></td>
+                </tr>
+            <?php endforeach; ?>
+            </tbody>
+        </table>
+
+        <form method="post" style="margin-top:12px;">
             <?php wp_nonce_field('ls_save', 'ls_nonce'); ?>
             <input type="hidden" name="ls_action" value="clear_log">
             <button class="button" onclick="return confirm('Clear all log entries?');">Clear Log</button>
         </form>
 
-        <table class="widefat striped">
-            <thead><tr>
-                <th style="width:180px;">When</th>
-                <th style="width:160px;">IP</th>
-                <th style="width:120px;">Action</th>
-                <th>Reason / URI</th>
-                <th>User-Agent</th>
-            </tr></thead>
-            <tbody>
-            <?php if (!empty($log)): foreach ($log as $e): ?>
-                <tr>
-                    <td><?php echo esc_html(function_exists('wp_date')?wp_date($fmt,intval($e['ts']),$tz):date_i18n($fmt,intval($e['ts']))); ?></td>
-                    <td><?php echo esc_html($e['ip'] ?? ''); ?></td>
-                    <td><?php echo esc_html($e['action'] ?? ''); ?></td>
-                    <td>
-                        <?php
-                        $reason = isset($e['reason']) ? $e['reason'] : '';
-                        $uri = isset($e['uri']) ? $e['uri'] : '';
-                        $meta = array();
-                        foreach ($e as $k=>$v) {
-                            if (strpos($k,'meta_')===0 && $v!=='') { $meta[] = esc_html(substr($k,5)) . '=' . esc_html($v); }
-                        }
-                        echo esc_html($reason);
-                        if ($uri) { echo '<br><code>'.esc_html($uri).'</code>'; }
-                        if (!empty($meta)) { echo '<br><small>'.implode(' • ', $meta).'</small>'; }
-                        ?>
-                    </td>
-                    <td><?php echo esc_html($e['ua'] ?? ''); ?></td>
-                </tr>
-            <?php endforeach; else: ?>
-                <tr><td colspan="5">No log entries yet.</td></tr>
-            <?php endif; ?>
-            </tbody>
-        </table>
+        <style>
+  /* Table sizing + common cell spacing */
+  #ls-log-table { width: 100% !important; table-layout: auto; }
+  #ls-log-table td, #ls-log-table th { vertical-align: top; line-height: 1.45; }
+  #ls-log-table td { padding: 8px 10px; }
+
+  /* WHEN: readable but doesn’t force horizontal scrolling */
+  #ls-log-table th.when-col,
+  #ls-log-table td.when-col {
+      white-space: nowrap;
+      min-width: 18ch; /* ~160–180px for typical date formats */
+  }
+
+  /* IP: make it wide enough for full IPv6, never wrap */
+  #ls-log-table th.ip-col,
+  #ls-log-table td.ip-col {
+      min-width: 42ch;        /* fits full IPv6 (up to 39 chars) comfortably */
+      white-space: nowrap;    /* keep address on one line */
+  }
+  /* ensure our earlier code-wrapping rule doesn’t affect IPs */
+  #ls-log-table td.ip-col code { white-space: nowrap; font-variant-numeric: tabular-nums; }
+
+  /* UA: wrap aggressively so it never causes sideways scroll */
+  #ls-log-table td.ua-col,
+  #ls-log-table td.ua-col .ua-wrap {
+      overflow-wrap: anywhere;
+      word-break: break-word;
+      white-space: normal;
+      max-width: 1px;   /* lets it shrink within flex layout */
+      width: 100%;
+  }
+
+  /* URIs in <code> often have no spaces; allow wrapping for them */
+  #ls-log-table code {
+      white-space: normal;
+      word-break: break-word;
+      overflow-wrap: anywhere;
+  }
+
+  .ls-muted { opacity: .85; }
+  /* DataTables pagination button polish */
+  div.dataTables_wrapper .dataTables_paginate .paginate_button {
+      padding: 0.2em 0.6em;
+  }
+
+  /* No sort cursors/indicators anywhere */
+  #ls-log-table.dataTable thead th { cursor: default !important; }
+  #ls-log-table.dataTable thead th.sorting,
+  #ls-log-table.dataTable thead th.sorting_asc,
+  #ls-log-table.dataTable thead th.sorting_desc,
+  #ls-log-table.dataTable thead th.sorting_disabled {
+    background-image: none !important;
+  }
+
+  #ls-log-table .sorting-indicator,
+  #ls-log-table.dataTable thead th:before,
+  #ls-log-table.dataTable thead th:after { display: none !important; }
+        </style>
+
+<script>
+jQuery(function($){
+  $('#ls-log-table').DataTable({
+      ordering: true,
+      order: [[0, 'desc']], // sort by first column (index 0) in descending order
+
+      // keep the rest
+      pageLength: 100,
+      autoWidth: false,
+      responsive: false,
+      searching: true,
+      info: true,
+      lengthChange: true,
+      columnDefs: [
+          { targets: 0, visible: false, searchable: false }, // hidden unix ts (kept, but unused)
+          { targets: 1, className: 'when-col' },             // When
+          { targets: 2, className: 'ip-col' },               // IP
+          { targets: 5, className: 'ua-col' }                // User-Agent
+      ],
+      dom: '<"top"f>rt<"bottom"lip><"clear">'
+  });
+});
+</script>
     </div>
-<?php }
+    <?php
+}
+
+
 
 // Load the stats dashboard (admin only)
 if (is_admin() && file_exists(__DIR__ . '/lightshield-dashboard.php')) {
     require_once __DIR__ . '/lightshield-dashboard.php';
 }
+
+// Load DataTables only on the LightShield Log page
+add_action('admin_enqueue_scripts', function () {
+    if (!isset($_GET['page']) || $_GET['page'] !== 'lightshield-security-log') return;
+
+    wp_enqueue_script('jquery');
+
+    // DataTables CSS & JS (CDN)
+    wp_enqueue_style(
+        'datatables-css',
+        'https://cdn.datatables.net/1.13.6/css/jquery.dataTables.min.css',
+        [],
+        '1.13.6'
+    );
+    wp_enqueue_script(
+        'datatables-js',
+        'https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js',
+        ['jquery'],
+        '1.13.6',
+        true
+    );
+});
+
