@@ -175,7 +175,7 @@ add_action('admin_notices', function () {
             var res = await fetchText(providers[i]);
             if (res.ok && ipv4Pattern.test(res.ip)) {
               v4El.textContent = res.ip;
-              if (srcEl) srcEl.textContent = ' (from browser lookup)';
+              //if (srcEl) srcEl.textContent = ' (from browser lookup)';
               done = true;
               return;
             }
@@ -188,3 +188,145 @@ add_action('admin_notices', function () {
     <?php
 });
 
+
+/**
+ * Decide if a User-Agent should be blocked.
+ * Strategy: allowlist (early exit) -> literal blacklist -> small regex blacklist.
+ */
+function ls_ua_is_bad(string $ua): array {
+    // Normalize once for cheap, case-insensitive substring checks.
+    $ua_lc = strtolower($ua);
+    $why   = '';
+    $tok   = '';
+
+    // 0) Empty or placeholder UA => bad
+    if ($ua === '' || $ua === '-') {
+        return [true, 'empty-ua', ''];
+    }
+
+    // 1) Allowlist (cheap early exit). Add/remove to taste.
+    static $ALLOW = [
+        'googlebot','applebot','bingbot','yandexbot','duckduckgo','baiduspider','slurp',
+        'ahrefsbot','semrushbot','mj12bot','facebookexternalhit','twitterbot','linkedinbot',
+        'slackbot','pinterestbot','pingdom.com_bot','uptimerobot','betterstackbot',
+        'cron-job.org','gptbot','chatgpt-user','claudebot','anthropic-ai','perplexitybot',
+        'censys.io','shodan','bitsightbot','jetpack'
+    ];
+    foreach ($ALLOW as $ok) {
+        if ($ok !== '' && strpos($ua_lc, $ok) !== false) {
+            return [false, 'allow', $ok];
+        }
+    }
+
+    // 2) Literal blacklist (fast path). Include only plain substrings (no regex metachars needed).
+    //    This list combines common scanners plus a large subset of Perishable Press tokens.
+    static $BAD_LITERALS = [
+        // Common security/scanner tools and HTTP libs
+        'sqlmap','acunetix','nikto','nessus','wpscan','wpscanner','masscan','nmap',
+        'python-requests','libwww-perl','libwww','curl','wget','scrapy','java/','okhttp',
+        'apachebench','ab/','go-http-client','httpclient','winhttp','winhttprequest','lwp',
+        'mechanize','urllib','aiohttp','restsharp','http-get',' httpget',
+        // Generic/abusive
+        'botnet','spammer','crawler0','download', 'sitecrawler','grabber','copier','reaper',
+        'proxy','vacuum','spiderbot','webzip','webcopier','webstripper','website.quester',
+        'webdownloader','websucker','websnake','webfetch','webhook','libwhisker',
+        // Perishable Press (selected literals that are meaningful substrings)
+        'alexibot','almaden','atomz','autoemailspider','autohttp','backdoorbot','backstreet',
+        'backweb','badass','baid','bandit','basichttp','bdfetch','bigfoot','bilgi','bitacle',
+        'black.hole','blackwidow','blogshares.spiders','bmclient','boitho','bookmark.search.tool',
+        'botalot','botpaidtoclick','brandwatch','browsex','browsezilla','bsalsa','bumblebee',
+        'cafek','cisco','clshttp','coldfusion','commentreader','core-project','cr4nk','crank',
+        'craft','crawler0','cshttp','cyberalert','daobot','dark','digger','digimarc','discobot',
+        'dnloadmage','dotbot','doubanbot','dreampassport','dsurf','dtaagent','dts','dynaweb',
+        'earthcom','easydl','emailcollector','emailsearch','emailsiphon','emailwolf',
+        'enterprise_search','envolk','exabot','exploit','extractorpro','fastlwspider',
+        'favorites.sweeper','filehound','firebat','flickbot','fooy','forex','franklin.locator',
+        'freshdownload','frontpage','fsurf','fyber','galaxybot','gamespy_arcade','ginxbot',
+        'go.zilla','goldfire','got-it','goforit','gosearch','grabnet','grub','grub-client',
+        'gsearch','guidebot','gvfs','hippo','homepagesearch','houxoucrawler','hpprint','htdig',
+        'httpretriever','httrack','hybrid','ia_archiver','ibm_planetwide','ichiro','idbot',
+        'ieauto','iemp','igetter','iltrov','image.stripper','image.sucker','imagefetch',
+        'incywincy','industry.program','ineturl','infonav','insuran.','intelliseek','interget',
+        'internet.ninja','internetlinkagent','internetseer.com','irlbot','isc_sys','isilo',
+        'isrccrawler','isspi','iupui.research.bot','jeteye','joc','kapere','kenjin','kernel',
+        'kfsw','krug','ksibot','kwebget','larbin','leech','leechftp','leechget','libcrawl',
+        'libcurl','libfetch','libghttp','libweb','lightningdownload','link.sleuth','linkscan',
+        'linktiger','linkwalker','lmq','lnspiderguy','localcombot','lwp-request','lwp-trivial',
+        'magnet','mail.sweeper','majestic','mcspider','mediapartners', // caution: Google AdSense uses this, keep in ALLOW if needed
+        'megaupload','metaspin','microsoft.url','mirror','missigua.locator','mj12','mlbot',
+        'mmmo.crawl','mnog','moreoverbot','mothra/netscan','movabletype','mozdex','mp3bot',
+        'msfrontpage','msiecrawler','msnptc','msrbot','multithreaddb','netants','netcarta',
+        'netcraft','netcrawl','netmech','netprospector','netresearchserver','net.vampire',
+        'newlisp','newt','nikto','npbot','nutch','nutex','offline.explorer','offline.navigator',
+        'openbot','opentextsitecrawler','orangebot','orbit','pagegrabber','pansci','persona',
+        'php.vers','phpot','pingalink','playstarmusic','poe-com','powerset','privoxy',
+        'progressive.download','propowerbot','prowebwalker','prozilla','psbot','psurf',
+        'psycheclone','puxarapido','pycurl','pyq','query','rambler','realdownload','relevantnoise',
+        'retriever','rob o z','rover','rpt-http','rsync','sapo','sbider','scagent','scooter',
+        'searchhippo','searchme','searchpreview','seekbot','seeker','sensis','sharp','shopwiki',
+        'sicklebot','sitesnagger','sitesucker','sitevigil','slurp y.verifier','smartdownload',
+        'snag','snake','snapbot','snoop','soc sci','sogou','solr','sootle','spacebison',
+        'sphider','spiderengine','spiderview','spurl','spyder','sq.webscanner','sqworm',
+        'ssm_ag','statbot','strip','studybot','subot','suck','sunrise','superbot','superhttp',
+        'surfbot','surfwalker','suz u','sweep','syncrisis','szukacz','talkro','tarantula',
+        'tarspider','teamsoft','teleport','telesoft','tencent','terrawiz','texnut','the.nomad',
+        'tmcrawler','to crawl','tongco','torrent','true','tutor gig','tv33_mercator','twat',
+        'twisted.pagegetter','ucmore','udmsearch','ultraseek','universalfeedparser','upg1',
+        'utilmind','url_spider_pro','urldispatcher','urlgetfile','urlspiderpro','urly',
+        'user-agent','useragent','vacuum','valet','veri~li','viewer','virtual','visibilitygap',
+        'voilabot','voyager','vspider','w3c','walhello','wapt','wavefire','wbdbot','web.by.mail',
+        'web.data.extractor','web.downloader','web.mole','web.sucker','web2mal','web2wap',
+        'webaltbot','webauto','webbandit','webbot','webcapture','webcat','webcollage',
+        'webcollector','webcopier','webcopy','webcor','webdav','webdevil','webdup','webemail',
+        'webenhancer','webfountain','weblea','webmirror','webmole','webpin','webpix','webreaper',
+        'webripper','webrobot','websauger','webtre','webvac','webwalk','webwasher','webweasel',
+        'webwhacker','webzip','werelatebot','whack','whacker','widow','winht','winhttprequest',
+        'winhttrack','wisebot','wisenutbot','wizz','wordp','works','world','wweb','www-collector',
+        'www.mechanize','www.ranks.nl','wwwster','xaldon','xenu','xget','ytunnel','zade','zbot',
+        'zeal','zebot','zeus','zipcode','zixy','zmao','zyborg',
+    ];
+
+    foreach ($BAD_LITERALS as $lit) {
+        if ($lit !== '' && strpos($ua_lc, $lit) !== false) {
+            return [true, 'literal', $lit];
+        }
+    }
+
+    // 3) Regex blacklist (only for tokens that require anchors/special chars)
+    //    Keep this *small*. All patterns are lower-case (we matched against $ua, not $ua_lc, to keep anchors precise).
+    static $BAD_REGEX = '~
+        (?:                                  # group of alternatives
+            ^attach                           # starts with "attach"
+          | ^da$                              # exactly "da"
+          | ^java                             # starts with "java"
+          | ^mozilla$                         # exactly "mozilla"
+          | mozilla/1\.22
+          | mozilla/22
+          | ^mozilla/3\.0\.\(compatible
+          | mozilla/4\.0\(compatible
+          | mozilla/4\.08
+          | mozilla/4\.61\.\(macintosh
+          | firefox\.2\.0
+          | iexplore\.exe
+          | char\(32,35\)
+          | google\.wireless\.transcoder
+          | googlebot\-image
+          | go\.zilla
+          | \+select\+                        # SQLi probes
+          | \+union\+                         # SQLi probes
+          | 1,1,1,                            # suspicious UA marker
+          | ^gotit$                           # exactly "gotit"
+          | gsa\-cra
+          | msnbot\-media
+          | msnbot\-products
+          | www\.ranks\.nl
+        )
+    ~i';
+
+    if (preg_match($BAD_REGEX, $ua)) {
+        return [true, 'regex', 'pattern'];
+    }
+
+    // Passed all checks
+    return [false, '', ''];
+}

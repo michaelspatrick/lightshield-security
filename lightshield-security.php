@@ -2,7 +2,7 @@
 /*
 Plugin Name: LightShield Security
 Description: Lightweight protection against brute force login attempts, bad bots, xmlrpc access, and simple request spikes. Includes IP whitelist/blocklist with a clean admin UI. Optional Cloudflare IP blocking at the edge.
-Version: 1.4.2
+Version: 1.5.0
 Author: Dragon Society International
 License: GPLv2 or later
 */
@@ -423,17 +423,12 @@ add_action('plugins_loaded', function () {
 
     if (!empty($settings['block_bad_ua'])) {
         $ua = isset($_SERVER['HTTP_USER_AGENT']) ? strtolower($_SERVER['HTTP_USER_AGENT']) : '';
-        $bad = false;
-        if ($ua === '' || $ua === '-') { $bad = true; }
-        $patterns = array('sqlmap','acunetix','nikto','nessus','wpscanner','wpscan','curl','python-requests','libwww-perl','masscan','apachebench','scrapy','httpclient',
-                          'winhttp','botnet','spammer');
-        foreach ($patterns as $p) { if ($ua && stripos($ua, $p) !== false) { $bad = true; break; } }
-        $allow_if_contains = array('googlebot','applebot','bingbot','yandex','duckduckgo','baiduspider','slurp','yandexbot','ahrefsbot','semrushbot','mj12bot','facebookexternalhit',
-                                   'twitterbot','linkedinbot','slackbot','pinterestbot','pingdom.com_bot','uptimerobot','betterstackbot','cron-job.org','gptbot','chatgpt-user',
-                                   'claudebot','anthropic-ai','perplexitybot','censys.io','shodan','bitsightbot','jetpack'
-                                  );
-        foreach ($allow_if_contains as $good) { if ($ua && stripos($ua, $good) !== false) { $bad = false; break; } }
-        if ($bad) { ls_block_ip($ip, 60, 'Bad user-agent'); ls_log('deny', 'Bad user-agent'); ls_forbid_now('Bad user-agent.'); }
+        [$bad, $why, $token] = ls_ua_is_bad($ua);
+        if ($bad) { 
+          ls_block_ip($ip, 60, 'Bad user-agent'); 
+          ls_log('deny', 'Bad user-agent'); 
+          ls_forbid_now('Bad user-agent.'); 
+        }
     }
 
     // Malicious pattern filter (URI & query)
